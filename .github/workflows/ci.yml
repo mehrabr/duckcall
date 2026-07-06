@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race ./...
+      - name: fuzz (smoke)
+        run: |
+          go test -fuzz=FuzzDecodeChunk -fuzztime=20s ./codec
+          go test -fuzz=FuzzDecodeSchema -fuzztime=10s ./codec
+      - name: deslop
+        if: github.event_name == 'pull_request'
+        run: scripts/deslop.sh --range "origin/${{ github.base_ref }}..HEAD"
+
+  # Placeholder for the conformance matrix: once quack_serve runs in CI,
+  # pinned DuckDB releases go here, plus a scheduled nightly against
+  # core_nightly that is allowed to fail loudly.

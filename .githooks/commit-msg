@@ -1,0 +1,2 @@
+#!/bin/sh
+exec scripts/deslop.sh --message "$1"

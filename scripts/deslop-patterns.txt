@@ -1,0 +1,25 @@
+# Patterns rejected by deslop.sh in staged diffs and commit messages.
+# Extended grep syntax, one per line. A hit is escaped inline with
+# "deslop:allow <reason>".
+
+# Tool attribution. Non-negotiable; no allow-escape survives review.
+Co-Authored-By:.*(Claude|Copilot|ChatGPT|Gemini|Cursor)
+noreply@anthropic\.com
+Generated with.*(Claude|Copilot|ChatGPT|AI)
+🤖
+
+# Machine-voice prose tells.
+[Hh]ere'?s where it gets interesting
+[Tt]he key insight
+[Ii]t'?s worth noting that
+[Ii]n conclusion
+[Ll]et'?s d(ive|elve) in
+\bdelve\b
+\bseamless(ly)?\b
+\bgame.?changer\b
+[Nn]o server\. [Nn]o setup\.
+
+# Scaffolding comments that restate the line below them.
+//+ *[Ii]nitialize the
+//+ *[Cc]reate a new
+//+ *[Dd]efine the
