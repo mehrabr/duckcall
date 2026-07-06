@@ -14,13 +14,8 @@ import (
 	"github.com/mehrabr/duckcall/codec"
 )
 
-// releaseTimeout bounds the DELETE that frees a server-side result when the
-// original query context is already gone.
-const releaseTimeout = 5 * time.Second
-
 type rows struct {
 	res    *duckcall.Result
-	ctx    context.Context
 	next   func() (*codec.Chunk, error, bool)
 	stop   func()
 	chunk  *codec.Chunk
@@ -30,7 +25,7 @@ type rows struct {
 
 func newRows(ctx context.Context, res *duckcall.Result) *rows {
 	next, stop := iter.Pull2(res.Chunks(ctx))
-	return &rows{res: res, ctx: ctx, next: next, stop: stop}
+	return &rows{res: res, next: next, stop: stop}
 }
 
 func (r *rows) Columns() []string {
@@ -79,12 +74,9 @@ func (r *rows) Close() error {
 	}
 	r.closed = true
 	r.stop()
-	// Release the server-side result even if the caller abandoned the
-	// stream early; the query context may already be dead, so use a fresh
-	// bounded one.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.ctx), releaseTimeout)
-	defer cancel()
-	return r.res.Close(ctx)
+	// The protocol has no per-result release; this only stops any
+	// still-running fetches.
+	return r.res.Close(context.Background())
 }
 
 // toDriverValue narrows codec's Go types to the driver.Value set. Lossless

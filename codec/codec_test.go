@@ -278,7 +278,7 @@ func TestCompressedVectors(t *testing.T) {
 	codectest.WriteType(&w, codectest.T(codec.TypeVarchar))
 	w.Field(102)
 	w.Uvarint(1)
-	w.FieldUvarint(90, 3)                                                     // DICTIONARY_VECTOR
+	w.FieldUvarint(90, 3)                                                    // DICTIONARY_VECTOR
 	w.FieldBytes(91, []byte{0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}) // sel 0,1,1,0
 	w.FieldUvarint(92, 2)
 	w.FieldBool(100, false)

@@ -61,6 +61,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	var body []byte
 	err = c.retry(ctx, func() (bool, error) {
 		var status int
+		var err error
 		hdr, body, status, err = c.roundTrip(ctx, msg)
 		return status == 0 || retryableStatus(status), err
 	})

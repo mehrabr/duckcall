@@ -54,10 +54,10 @@ func (c *Conn) Close(ctx context.Context) error { return c.w.Close(ctx) }
 // Server-side result state lives and dies with the connection — there is no
 // release message in the protocol, so Close only stops the stream.
 type Result struct {
-	conn    *Conn
-	pr      *codec.PrepareResult
-	stopped sync.Once
-	stop    chan struct{}
+	conn     *Conn
+	pr       *codec.PrepareResult
+	stopOnce sync.Once
+	stop     chan struct{}
 }
 
 // Query submits SQL. When it returns, the schema and the server's inline
@@ -180,6 +180,6 @@ func (r *Result) Chunks(ctx context.Context) iter.Seq2[*codec.Chunk, error] {
 // Close stops any in-flight fetching. The protocol has no per-result
 // release; server-side leftovers are reclaimed when the connection closes.
 func (r *Result) Close(ctx context.Context) error {
-	r.stopped.Do(func() { close(r.stop) })
+	r.stopOnce.Do(func() { close(r.stop) })
 	return nil
 }
