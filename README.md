@@ -1,11 +1,10 @@
 # duckcall
 
-Quack turned DuckDB into a client-server database over HTTP, and so far every
-Quack client is itself a DuckDB instance. duckcall speaks the wire without
-being one: a pure-Go, read-only client, no CGO, no embedded engine. A duck
-call is the device a non-duck uses to produce a quack, which is exactly what
-this is — and a query through it is, literally, a remote procedure call to a
-duck.
+Quack turned DuckDB into a client-server database over HTTP. Independent
+clients already exist for TypeScript, .NET, and Elixir; duckcall is the Go
+one — pure Go, read-only, no CGO, no embedded engine. A duck call is the
+device a non-duck uses to produce a quack, which is exactly what this is —
+and a query through it is, literally, a remote procedure call to a duck.
 
 ```go
 import (
