@@ -1,0 +1,11 @@
+# binaries
+/quackbouncer
+/dist/
+
+# go tooling
+*.test
+*.out
+/vendor/
+
+# fuzz artifacts kept local until triaged
+testdata/fuzz/*/
