@@ -53,7 +53,7 @@ func (c *Codec) DecodeSchema(buf []byte) (*Schema, error) {
 				return nil, qser.ErrTruncated
 			}
 			s.Columns = make([]SchemaColumn, 0, n)
-			for i := uint64(0); i < n; i++ {
+			for range n {
 				f, err := decodeStructField(r, 0)
 				if err != nil {
 					return nil, err
@@ -103,7 +103,6 @@ func (c *Chunk) Value(col, row int) (any, error) {
 	return cl.vals[row], nil
 }
 
-// Err returns the column's decode error, if any.
 func (cl *Column) Err() error { return cl.err }
 
 func (cl *Column) Value(row int) any { return cl.vals[row] }
@@ -149,7 +148,7 @@ func (c *Codec) DecodeChunk(buf []byte) (*Chunk, error) {
 				return nil, qser.ErrTruncated
 			}
 			ch.cols = make([]Column, 0, n)
-			for i := uint64(0); i < n; i++ {
+			for range n {
 				col, err := decodeVector(r, ch.rows)
 				if err != nil {
 					return nil, err
@@ -263,7 +262,7 @@ func decodeValues(t LogicalType, rows int, validity, data, heap []byte) ([]any, 
 		return nil, fmt.Errorf("codec: %s vector data short: %d bytes for %d rows", t, len(data), rows)
 	}
 	vals := make([]any, rows)
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		if !valid(validity, i) {
 			continue
 		}

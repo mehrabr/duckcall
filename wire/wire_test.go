@@ -120,7 +120,7 @@ func TestStreamChunksOrdered(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for r := 0; r < ch.RowCount(); r++ {
+		for r := range ch.RowCount() {
 			v, err := ch.Value(0, r)
 			if err != nil {
 				t.Fatal(err)

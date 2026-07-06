@@ -170,7 +170,7 @@ func decodeType(r *qser.Reader, depth int) (LogicalType, error) {
 				return t, qser.ErrTruncated
 			}
 			t.Fields = make([]StructField, 0, n)
-			for i := uint64(0); i < n; i++ {
+			for range n {
 				f, err := decodeStructField(r, depth+1)
 				if err != nil {
 					return t, err

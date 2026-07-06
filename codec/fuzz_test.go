@@ -28,8 +28,8 @@ func FuzzDecodeChunk(f *testing.F) {
 			return
 		}
 		// A successful decode must be internally consistent and re-readable.
-		for col := 0; col < ch.ColumnCount(); col++ {
-			for row := 0; row < ch.RowCount(); row++ {
+		for col := range ch.ColumnCount() {
+			for row := range ch.RowCount() {
 				ch.Value(col, row)
 			}
 		}

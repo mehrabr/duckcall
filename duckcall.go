@@ -45,10 +45,8 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	return &Conn{w: w, cd: cd}, nil
 }
 
-// ServerVersion reports what the server announced at connect time.
 func (c *Conn) ServerVersion() string { return c.w.Handshake().ServerVersion }
 
-// Close ends the session.
 func (c *Conn) Close(ctx context.Context) error { return c.w.Close(ctx) }
 
 // Result is a streaming query result. Rows live on the server until fetched;
@@ -74,7 +72,6 @@ func (c *Conn) Query(ctx context.Context, sql string) (*Result, error) {
 	return &Result{conn: c, res: res, schema: schema}, nil
 }
 
-// Schema returns column names and types.
 func (r *Result) Schema() *codec.Schema { return r.schema }
 
 // Chunks streams decoded chunks in row order, fetching in parallel under the

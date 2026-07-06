@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 )
 
 // Field payload kinds.
@@ -138,7 +137,7 @@ func (r *Reader) Skip(kind byte) error {
 		if n > uint64(r.Remaining()) {
 			return ErrTruncated
 		}
-		for i := uint64(0); i < n; i++ {
+		for range n {
 			if err := r.SkipObject(); err != nil {
 				return err
 			}
@@ -217,7 +216,3 @@ func (w *Writer) FieldList(id, count uint64) {
 }
 
 func (w *Writer) End() { w.uvarint(0) }
-
-// Float bit helpers keep NaN payloads intact across the wire.
-func Float32bits(f float32) uint32 { return math.Float32bits(f) }
-func Float64bits(f float64) uint64 { return math.Float64bits(f) }

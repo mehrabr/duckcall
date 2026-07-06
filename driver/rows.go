@@ -7,6 +7,7 @@ import (
 	"io"
 	"iter"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/mehrabr/duckcall"
@@ -106,7 +107,7 @@ func toDriverValue(v any) (driver.Value, error) {
 		return int64(x), nil
 	case uint64:
 		if x > math.MaxInt64 {
-			return fmt.Sprintf("%d", x), nil
+			return strconv.FormatUint(x, 10), nil
 		}
 		return int64(x), nil
 	case float32:

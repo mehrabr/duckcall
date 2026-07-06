@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,9 +90,7 @@ func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.m.inc("quackbouncer_upstream_connects_total", "")
 	}
 
-	buf := make([]byte, 16)
-	rand.Read(buf)
-	sid := hex.EncodeToString(buf)
+	sid := rand.Text()
 	p.mu.Lock()
 	p.sessions[sid] = up
 	p.mu.Unlock()

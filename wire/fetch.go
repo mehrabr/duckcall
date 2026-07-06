@@ -32,7 +32,7 @@ func (c *Client) StreamChunks(ctx context.Context, r *Result) iter.Seq2[[]byte, 
 
 		var wg sync.WaitGroup
 		next := make(chan int)
-		for w := 0; w < min(c.cfg.FetchWorkers, r.ChunkCount); w++ {
+		for range min(c.cfg.FetchWorkers, r.ChunkCount) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -48,7 +48,7 @@ func (c *Client) StreamChunks(ctx context.Context, r *Result) iter.Seq2[[]byte, 
 		}
 		go func() {
 			defer close(next)
-			for i := 0; i < r.ChunkCount; i++ {
+			for i := range r.ChunkCount {
 				select {
 				case next <- i:
 				case <-ctx.Done():
@@ -58,7 +58,7 @@ func (c *Client) StreamChunks(ctx context.Context, r *Result) iter.Seq2[[]byte, 
 		}()
 		defer wg.Wait()
 
-		for i := 0; i < r.ChunkCount; i++ {
+		for i := range r.ChunkCount {
 			select {
 			case s := <-slots[i]:
 				if s.err != nil {

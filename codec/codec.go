@@ -5,7 +5,11 @@
 // another client's test oracle.
 package codec
 
-import "fmt"
+import (
+	"fmt"
+	"maps"
+	"slices"
+)
 
 // Codec decodes payloads for one negotiated protocol/serialization version
 // pair. Codecs are stateless and safe for concurrent use.
@@ -20,15 +24,10 @@ func For(protocol, serialization int) (*Codec, error) {
 	if c, ok := registry[versionKey{protocol, serialization}]; ok {
 		return c, nil
 	}
-	supported := make([]versionKey, 0, len(registry))
-	for k := range registry {
-		supported = append(supported, k)
-	}
 	return nil, fmt.Errorf("codec: no decoder for protocol %d / serialization %d (supported: %v)",
-		protocol, serialization, supported)
+		protocol, serialization, slices.Collect(maps.Keys(registry)))
 }
 
-// Versions reports the pair this codec was selected for.
 func (c *Codec) Versions() (protocol, serialization int) {
 	return c.protocol, c.serialization
 }

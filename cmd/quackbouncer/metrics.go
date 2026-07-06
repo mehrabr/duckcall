@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -46,29 +47,13 @@ func (m *metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	defer m.mu.Unlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 
-	names := make([]string, 0, len(m.counters))
-	for name := range m.counters {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(m.counters)) {
 		fmt.Fprintf(w, "# TYPE %s counter\n", name)
-		series := make([]string, 0, len(m.counters[name]))
-		for labels := range m.counters[name] {
-			series = append(series, labels)
-		}
-		sort.Strings(series)
-		for _, labels := range series {
+		for _, labels := range slices.Sorted(maps.Keys(m.counters[name])) {
 			fmt.Fprintf(w, "%s%s %g\n", name, labels, m.counters[name][labels])
 		}
 	}
-
-	names = names[:0]
-	for name := range m.gauges {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(m.gauges)) {
 		fmt.Fprintf(w, "# TYPE %s gauge\n", name)
 		fmt.Fprintf(w, "%s %g\n", name, m.gauges[name]())
 	}

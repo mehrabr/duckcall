@@ -58,7 +58,7 @@ func TestEndToEndThroughProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for r := 0; r < chunk.RowCount(); r++ {
+		for r := range chunk.RowCount() {
 			v, err := chunk.Value(0, r)
 			if err != nil {
 				t.Fatal(err)

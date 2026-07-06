@@ -20,10 +20,9 @@ import (
 // safe for concurrent use; the protocol is client-driven request/response,
 // so concurrency is just multiple HTTP requests carrying the same session.
 type Client struct {
-	cfg     Config
-	session string
-	hs      Handshake
-	closed  atomic.Bool
+	cfg    Config
+	hs     Handshake
+	closed atomic.Bool
 }
 
 // Handshake is what the server reported at connect time. The version pair
@@ -81,12 +80,10 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("wire: server negotiated protocol %d, this build speaks %d..%d",
 			hs.ProtocolVersion, protocolVersionMin, protocolVersionMax)
 	}
-	c.session = hs.SessionID
 	c.hs = hs
 	return c, nil
 }
 
-// Handshake returns the connect-time server report.
 func (c *Client) Handshake() Handshake { return c.hs }
 
 // queryResponse is the JSON control-plane reply to a query submission; the
@@ -195,8 +192,8 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	if c.session != "" {
-		req.Header.Set(sessionHeader, c.session)
+	if c.hs.SessionID != "" {
+		req.Header.Set(sessionHeader, c.hs.SessionID)
 	}
 	resp, err := c.cfg.HTTPClient.Do(req)
 	if err != nil {
