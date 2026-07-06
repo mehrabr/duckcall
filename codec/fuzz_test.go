@@ -8,17 +8,16 @@ import (
 )
 
 // A hand-rolled binary decoder without fuzzing is a CVE with a release date.
-// Both entry points take attacker-adjacent bytes (anything on the network
+// All entry points take attacker-adjacent bytes (anything on the network
 // path can mangle a payload), so the only requirements are: no panic, no
 // out-of-bounds, errors instead of garbage.
 
 func FuzzDecodeChunk(f *testing.F) {
 	f.Add(codectest.EncodeChunk(tier1Cols()))
-	f.Add(codectest.EncodeChunk(nil))
 	f.Add([]byte{})
 	f.Add([]byte{0})
-	f.Add([]byte{1, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01})
-	c, err := codec.For(1, 1)
+	f.Add([]byte{0x64, 0x00, 0x01, 0xff, 0xff})
+	c, err := codec.For(1)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -40,21 +39,53 @@ func FuzzDecodeChunk(f *testing.F) {
 	})
 }
 
-func FuzzDecodeSchema(f *testing.F) {
-	f.Add(codectest.EncodeSchema(tier1Cols()))
-	f.Add(codectest.EncodeSchema(nil))
+func FuzzDecodePrepare(f *testing.F) {
+	cols := tier1Cols()
+	f.Add(codectest.EncodePrepareBody(cols, [][]codectest.Col{cols}, true, codec.Hugeint{Upper: 1, Lower: 2}))
+	f.Add(codectest.EncodePrepareBody(nil, nil, false, codec.Hugeint{}))
 	f.Add([]byte{})
-	c, err := codec.For(1, 1)
+	c, err := codec.For(1)
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		s, err := c.DecodeSchema(data)
+		pr, err := c.DecodePrepare(data)
 		if err != nil {
 			return
 		}
-		for _, col := range s.Columns {
+		for _, col := range pr.Schema.Columns {
 			_ = col.Type.String()
+		}
+		for _, ch := range pr.Chunks {
+			for col := range ch.ColumnCount() {
+				for row := range ch.RowCount() {
+					ch.Value(col, row)
+				}
+			}
+		}
+	})
+}
+
+func FuzzDecodeFetch(f *testing.F) {
+	cols := tier1Cols()
+	f.Add(codectest.EncodeFetchBody([][]codectest.Col{cols}, 3))
+	f.Add(codectest.EncodeFetchBody(nil, codec.BatchIndexAbsent))
+	f.Add([]byte{})
+	c, err := codec.For(1)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		fr, err := c.DecodeFetch(data)
+		if err != nil {
+			return
+		}
+		for _, ch := range fr.Chunks {
+			for col := range ch.ColumnCount() {
+				for row := range ch.RowCount() {
+					ch.Value(col, row)
+				}
+			}
 		}
 	})
 }

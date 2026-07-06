@@ -49,19 +49,71 @@ func TestNativeQuickstart(t *testing.T) {
 	if err := res.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if s.OpenQueries() != 0 {
-		t.Fatal("result not released")
+	if err := conn.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s.OpenConnections() != 0 {
+		t.Fatal("connection not released")
 	}
 }
 
-func TestDialRejectsUnknownCodec(t *testing.T) {
+// TestFetchLoopStreamsEverything pushes a result well past the inline
+// budget so rows arrive through concurrent fetches, and checks nothing is
+// lost or duplicated.
+func TestFetchLoopStreamsEverything(t *testing.T) {
 	s := quacktest.New("tok")
 	t.Cleanup(s.Close)
-	// quacktest can only lie about the protocol version within the range the
-	// transport accepts, which is exactly one version today, so this test
-	// drives the mismatch through the transport check instead.
-	s.ProtocolVersion = 2
+	const rows = 5000
+	vals := make([]any, rows)
+	for i := range vals {
+		vals[i] = int64(i)
+	}
+	s.AddResult("FROM big", []codectest.Col{
+		{Name: "i", Type: codectest.T(codec.TypeBigint), Vals: vals},
+	}, 128)
+
+	ctx := context.Background()
+	conn, err := duckcall.Dial(ctx, duckcall.Config{Endpoint: s.URL(), Token: "tok", FetchWorkers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+
+	res, err := conn.Query(ctx, "FROM big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Close(ctx)
+
+	seen := make([]bool, rows)
+	n := 0
+	for chunk, err := range res.Chunks(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		for r := range chunk.RowCount() {
+			v, err := chunk.Value(0, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			i := v.(int64)
+			if seen[i] {
+				t.Fatalf("row %d delivered twice", i)
+			}
+			seen[i] = true
+			n++
+		}
+	}
+	if n != rows {
+		t.Fatalf("streamed %d rows, want %d", n, rows)
+	}
+}
+
+func TestDialRejectsUnknownQuackVersion(t *testing.T) {
+	s := quacktest.New("tok")
+	t.Cleanup(s.Close)
+	s.QuackVersion = 2
 	if _, err := duckcall.Dial(context.Background(), duckcall.Config{Endpoint: s.URL(), Token: "tok"}); err == nil {
-		t.Fatal("dial succeeded against unsupported protocol")
+		t.Fatal("dial succeeded against unsupported quack version")
 	}
 }

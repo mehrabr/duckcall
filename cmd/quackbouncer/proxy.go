@@ -2,46 +2,39 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/mehrabr/duckcall/wire"
 )
 
 // proxy terminates TLS and client auth in front of a plain-HTTP quack_serve,
-// multiplexing client sessions onto pooled upstream sessions. Payloads pass
-// through untouched — the wire layer treats them as opaque bytes, and so
-// does the proxy. That is the whole trick: nothing here decodes a result,
-// so nothing here breaks when the serialization changes.
+// multiplexing client connections onto pooled upstream connections. Every
+// message's routing lives in its envelope header, so the proxy decodes
+// headers, swaps connection ids, and forwards bodies untouched — nothing
+// here decodes a result, so nothing here breaks when the chunk
+// serialization changes.
 type proxy struct {
 	tokens map[string]string // client token -> client name, for metrics
 	pool   *pool
 	m      *metrics
 
-	mu       sync.Mutex
-	sessions map[string]*wire.Client // bouncer session id -> upstream
+	mu    sync.Mutex
+	conns map[string]*wire.Client // virtual connection id -> upstream
 }
 
 func newProxy(tokens map[string]string, p *pool, m *metrics) *proxy {
-	px := &proxy{tokens: tokens, pool: p, m: m, sessions: map[string]*wire.Client{}}
-	m.gauge("quackbouncer_active_sessions", func() float64 {
+	px := &proxy{tokens: tokens, pool: p, m: m, conns: map[string]*wire.Client{}}
+	m.gauge("quackbouncer_active_connections", func() float64 {
 		px.mu.Lock()
 		defer px.mu.Unlock()
-		return float64(len(px.sessions))
+		return float64(len(px.conns))
 	})
 	m.gauge("quackbouncer_pool_idle", func() float64 { return float64(p.idleCount()) })
 	return px
-}
-
-func jsonError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 func (p *proxy) count(route string, code int) {
@@ -53,107 +46,129 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/metrics":
 		p.m.ServeHTTP(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/quack/v1/connect":
-		p.handleConnect(w, r)
-	case r.Method == http.MethodDelete && r.URL.Path == "/quack/v1/session":
-		p.handleDisconnect(w, r)
-	case strings.HasPrefix(r.URL.Path, "/quack/v1/"):
-		p.forward(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/quack":
+		p.handleRPC(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/":
+		p.count("banner", http.StatusOK)
+		fmt.Fprintln(w, "quackbouncer: a pooling proxy for DuckDB Quack endpoints.")
 	default:
 		p.count("other", http.StatusNotFound)
-		jsonError(w, http.StatusNotFound, "no such endpoint")
+		http.Error(w, "no such endpoint", http.StatusNotFound)
 	}
 }
 
-func (p *proxy) clientName(r *http.Request) (string, bool) {
-	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok {
-		return "", false
+// reply writes a message the bouncer authored itself. Protocol failures go
+// in-band like the real server's: ERROR_RESPONSE inside HTTP 200.
+func (p *proxy) reply(w http.ResponseWriter, hdr wire.Header, body []byte) {
+	if hdr.QueryID == 0 {
+		hdr.QueryID = wire.QueryIDAbsent
 	}
-	name, ok := p.tokens[token]
-	return name, ok
+	w.Header().Set("Content-Type", "application/vnd.duckdb")
+	w.Write(wire.EncodeEnvelope(hdr, body))
 }
 
-func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
-	if _, ok := p.clientName(r); !ok {
-		p.count("connect", http.StatusUnauthorized)
-		jsonError(w, http.StatusUnauthorized, "invalid token")
+func (p *proxy) errorReply(w http.ResponseWriter, route string, msg string) {
+	p.count(route, http.StatusOK)
+	p.reply(w, wire.Header{Type: wire.MsgError}, wire.ErrorMessage{Message: msg}.Encode())
+}
+
+func (p *proxy) handleRPC(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		p.count("read", http.StatusBadRequest)
+		http.Error(w, "read failed", http.StatusBadRequest)
+		return
+	}
+	hdr, body, err := wire.SplitEnvelope(raw)
+	if err != nil {
+		p.errorReply(w, "garbled", "quackbouncer: "+err.Error())
+		return
+	}
+	switch hdr.Type {
+	case wire.MsgConnectionRequest:
+		p.handleConnect(w, r, hdr, body)
+	case wire.MsgDisconnect:
+		p.handleDisconnect(w, hdr)
+	default:
+		p.forward(w, r, hdr, body)
+	}
+}
+
+func (p *proxy) handleConnect(w http.ResponseWriter, r *http.Request, hdr wire.Header, body []byte) {
+	req, err := wire.DecodeConnectionRequest(body)
+	if err != nil {
+		p.errorReply(w, "connect", "quackbouncer: "+err.Error())
+		return
+	}
+	if _, ok := p.tokens[req.AuthString]; !ok {
+		// Do not echo the credential; that mistake is upstream's to make.
+		p.errorReply(w, "connect", "Authentication failed")
 		return
 	}
 	up, reused, err := p.pool.get(r.Context())
 	if err != nil {
-		p.count("connect", http.StatusBadGateway)
-		jsonError(w, http.StatusBadGateway, "upstream connect failed: "+err.Error())
+		p.errorReply(w, "connect", "quackbouncer: upstream connect failed: "+err.Error())
 		return
 	}
 	if !reused {
 		p.m.inc("quackbouncer_upstream_connects_total", "")
 	}
 
-	sid := rand.Text()
+	vid := rand.Text()
 	p.mu.Lock()
-	p.sessions[sid] = up
+	p.conns[vid] = up
 	p.mu.Unlock()
 
-	hs := up.Handshake()
+	server := up.Server()
 	p.count("connect", http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]any{
-		"session_id":            sid,
-		"protocol_version":      hs.ProtocolVersion,
-		"serialization_version": hs.SerializationVersion,
-		"server_version":        hs.ServerVersion + " via quackbouncer",
-	})
+	p.reply(w,
+		wire.Header{Type: wire.MsgConnectionResponse, ConnectionID: vid, QueryID: hdr.QueryID},
+		wire.ConnectionResponse{
+			ServerVersion: server.ServerVersion + " via quackbouncer",
+			Platform:      server.Platform,
+			QuackVersion:  server.QuackVersion,
+		}.Encode(),
+	)
 }
 
-func (p *proxy) session(r *http.Request) (*wire.Client, bool) {
+func (p *proxy) handleDisconnect(w http.ResponseWriter, hdr wire.Header) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.sessions[r.Header.Get("X-Quack-Session")]
-	return c, ok
-}
-
-func (p *proxy) handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	sid := r.Header.Get("X-Quack-Session")
-	p.mu.Lock()
-	up, ok := p.sessions[sid]
-	delete(p.sessions, sid)
+	up, ok := p.conns[hdr.ConnectionID]
+	delete(p.conns, hdr.ConnectionID)
 	p.mu.Unlock()
 	if !ok {
-		p.count("disconnect", http.StatusForbidden)
-		jsonError(w, http.StatusForbidden, "unknown session")
+		p.errorReply(w, "disconnect", "Connection does not exist / already disconnected")
 		return
 	}
-	// The client's session ends; the upstream one goes back to the pool.
-	p.pool.put(r.Context(), up)
-	p.count("disconnect", http.StatusNoContent)
-	w.WriteHeader(http.StatusNoContent)
+	// The client's connection ends; the upstream one goes back to the pool.
+	// Fetchable results die with the virtual connection either way: their
+	// uuids were minted on this upstream and the client just forgot them.
+	p.pool.put(up)
+	p.count("disconnect", http.StatusOK)
+	p.reply(w, wire.Header{Type: wire.MsgSuccess, QueryID: hdr.QueryID}, wire.EncodeEmptyBody())
 }
 
-// forward relays any other protocol request over the mapped upstream
-// session. The upstream client re-stamps auth and session headers; body
-// bytes cross unread in both directions.
-func (p *proxy) forward(w http.ResponseWriter, r *http.Request) {
-	up, ok := p.session(r)
+// forward relays any other message over the mapped upstream connection,
+// rewriting the connection id outbound and back on the return path. Bodies
+// cross unread in both directions.
+func (p *proxy) forward(w http.ResponseWriter, r *http.Request, hdr wire.Header, body []byte) {
+	p.mu.Lock()
+	up, ok := p.conns[hdr.ConnectionID]
+	p.mu.Unlock()
 	if !ok {
-		p.count("forward", http.StatusForbidden)
-		jsonError(w, http.StatusForbidden, "unknown session")
+		p.errorReply(w, "forward", "Connection does not exist / already disconnected")
 		return
 	}
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
-	}
-	resp, err := up.Do(r.Context(), r.Method, path, r.Body, r.Header.Get("Content-Type"))
+	outHdr := hdr
+	outHdr.ConnectionID = up.ConnectionID()
+	respHdr, respBody, err := up.RoundTripRaw(r.Context(), wire.EncodeEnvelope(outHdr, body))
 	if err != nil {
-		p.count("forward", http.StatusBadGateway)
-		jsonError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
+		p.errorReply(w, "forward", "quackbouncer: upstream request failed: "+err.Error())
 		return
 	}
-	defer resp.Body.Close()
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
+	if respHdr.ConnectionID == up.ConnectionID() {
+		respHdr.ConnectionID = hdr.ConnectionID
 	}
-	p.count("forward", resp.StatusCode)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	p.count("forward", http.StatusOK)
+	p.reply(w, respHdr, respBody)
 }

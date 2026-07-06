@@ -1,65 +1,79 @@
 // Package quacktest is an in-process fake quack_serve speaking just enough
-// of the protocol for duckcall's own tests: token auth, sessions, canned
-// query results served as chunks. It is not a server implementation and
-// never will be — once a captured corpus from real quack_serve exists, the
-// differential harness supersedes most of what this fake is for.
+// of the real protocol for duckcall's own tests: token auth, connections,
+// canned query results served inline and over the fetch loop. It is not a
+// server implementation and never will be — the captured corpus in
+// testdata and the differential harness against real quack_serve are the
+// conformance story; this fake exists for fast, hermetic unit tests.
 package quacktest
 
 import (
-	"encoding/json"
-	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/mehrabr/duckcall/codec/codectest"
+	"github.com/mehrabr/duckcall/internal/qser"
+	"github.com/mehrabr/duckcall/wire"
 )
 
 type result struct {
-	schema []byte
-	chunks [][]byte
+	cols    []codectest.Col
+	batches [][][]codectest.Col // fetchable batches, each a set of chunks
+}
+
+type liveResult struct {
+	res  *result
+	next int // next batch index to hand out
 }
 
 // Server is the fake. Configure behavior fields before the first request.
 type Server struct {
 	HTTP *httptest.Server
 
-	// Token is the only accepted bearer token.
+	// Token is the only accepted auth string. The failure echoes the
+	// presented credential, which is exactly the server behavior the
+	// client's redaction exists for.
 	Token string
 
-	// ProtocolVersion lets tests simulate a server this build cannot speak.
-	ProtocolVersion int
+	// QuackVersion lets tests simulate a server this build cannot speak.
+	QuackVersion uint64
 
-	// FailFirst makes each chunk fetch fail with 503 this many times before
-	// succeeding, to exercise retry.
-	FailFirst int
+	// BatchChunks is how many chunks ride per batch: the inline budget of a
+	// prepare response and the size of each fetch response. Defaults to 2.
+	BatchChunks int
 
-	// ChunkDelay is a per-chunk-fetch sleep, for cancellation tests.
-	ChunkDelay time.Duration
+	// ConnectFails makes this many connection attempts fail with HTTP 503
+	// before succeeding, to exercise the connect retry.
+	ConnectFails int
 
-	mu          sync.Mutex
-	results     map[string]*result // by SQL text
-	sessions    map[string]bool
-	queries     map[string]*result
-	chunkFails  map[string]int
-	nextID      int
-	fetchCount  int
-	activeSess  int
-	activeQuery int
+	// FetchFails makes this many fetch requests fail with HTTP 503. Fetches
+	// must not retry, so one is enough to kill a stream.
+	FetchFails int
+
+	// FetchDelay is a per-fetch sleep, for cancellation tests.
+	FetchDelay time.Duration
+
+	mu         sync.Mutex
+	results    map[string]*result // by SQL text
+	conns      map[string]bool
+	live       map[qser.Hugeint]*liveResult
+	nextID     int
+	fetchCount int
+	activeConn int
 }
 
 // New starts a fake server with one valid token.
 func New(token string) *Server {
 	s := &Server{
-		Token:           token,
-		ProtocolVersion: 1,
-		results:         map[string]*result{},
-		sessions:        map[string]bool{},
-		queries:         map[string]*result{},
-		chunkFails:      map[string]int{},
+		Token:        token,
+		QuackVersion: 1,
+		BatchChunks:  2,
+		results:      map[string]*result{},
+		conns:        map[string]bool{},
+		live:         map[qser.Hugeint]*liveResult{},
 	}
 	s.HTTP = httptest.NewServer(s)
 	return s
@@ -69,27 +83,33 @@ func (s *Server) Close()      { s.HTTP.Close() }
 func (s *Server) URL() string { return s.HTTP.URL }
 
 // AddResult registers the reply for an exact SQL string, split into chunks
-// of chunkRows.
+// of chunkRows and batches of BatchChunks. The first batch rides inline in
+// the prepare response; the rest are fetched.
 func (s *Server) AddResult(sql string, cols []codectest.Col, chunkRows int) {
 	rows := 0
 	if len(cols) > 0 {
 		rows = len(cols[0].Vals)
 	}
-	res := &result{schema: codectest.EncodeSchema(cols)}
+	var chunks [][]codectest.Col
 	for at := 0; at < rows; at += chunkRows {
 		end := min(at+chunkRows, rows)
 		part := make([]codectest.Col, len(cols))
 		for i, c := range cols {
 			part[i] = codectest.Col{Name: c.Name, Type: c.Type, Vals: c.Vals[at:end]}
 		}
-		res.chunks = append(res.chunks, codectest.EncodeChunk(part))
+		chunks = append(chunks, part)
+	}
+	res := &result{cols: cols}
+	per := s.BatchChunks
+	for at := 0; at < len(chunks); at += per {
+		res.batches = append(res.batches, chunks[at:min(at+per, len(chunks))])
 	}
 	s.mu.Lock()
 	s.results[sql] = res
 	s.mu.Unlock()
 }
 
-// FetchCount reports how many chunk fetches the server has seen, including
+// FetchCount reports how many fetch requests the server has seen, including
 // the ones it failed on purpose.
 func (s *Server) FetchCount() int {
 	s.mu.Lock()
@@ -97,153 +117,177 @@ func (s *Server) FetchCount() int {
 	return s.fetchCount
 }
 
-// OpenSessions reports sessions connected and not yet closed.
-func (s *Server) OpenSessions() int {
+// OpenConnections reports connections opened and not yet disconnected.
+func (s *Server) OpenConnections() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.activeSess
-}
-
-// OpenQueries reports results not yet released.
-func (s *Server) OpenQueries() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.activeQuery
-}
-
-func jsonError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	return s.activeConn
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+s.Token {
-		// Echoing the presented credential back is exactly the kind of
-		// server behavior the client must redact.
-		jsonError(w, http.StatusUnauthorized, fmt.Sprintf("invalid token %q", strings.TrimPrefix(auth, "Bearer ")))
+	if r.Method != http.MethodPost || r.URL.Path != "/quack" {
+		http.Error(w, "This is a DuckDB Quack RPC endpoint.", http.StatusNotFound)
 		return
 	}
-
-	path := r.URL.Path
-	switch {
-	case r.Method == http.MethodPost && path == "/quack/v1/connect":
-		s.handleConnect(w)
-	case r.Method == http.MethodDelete && path == "/quack/v1/session":
-		s.withSession(w, r, s.handleSessionClose)
-	case r.Method == http.MethodPost && path == "/quack/v1/query":
-		s.withSession(w, r, func(w http.ResponseWriter, r *http.Request) { s.handleQuery(w, r) })
-	case strings.HasPrefix(path, "/quack/v1/query/"):
-		s.withSession(w, r, func(w http.ResponseWriter, r *http.Request) { s.handleQuerySub(w, r) })
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read failed", http.StatusBadRequest)
+		return
+	}
+	hdr, body, err := wire.SplitEnvelope(raw)
+	if err != nil {
+		s.reply(w, wire.Header{Type: wire.MsgError}, wire.ErrorMessage{Message: err.Error()}.Encode())
+		return
+	}
+	switch hdr.Type {
+	case wire.MsgConnectionRequest:
+		s.handleConnect(w, body)
+	case wire.MsgPrepareRequest:
+		s.withConn(w, hdr, func() { s.handlePrepare(w, hdr, body) })
+	case wire.MsgFetchRequest:
+		s.withConn(w, hdr, func() { s.handleFetch(w, body) })
+	case wire.MsgDisconnect:
+		s.handleDisconnect(w, hdr)
 	default:
-		jsonError(w, http.StatusNotFound, "no such endpoint")
+		s.errorReply(w, "unhandled message type "+hdr.Type.String())
 	}
 }
 
-func (s *Server) withSession(w http.ResponseWriter, r *http.Request, h http.HandlerFunc) {
-	sid := r.Header.Get("X-Quack-Session")
+func (s *Server) reply(w http.ResponseWriter, hdr wire.Header, body []byte) {
+	if hdr.QueryID == 0 {
+		hdr.QueryID = wire.QueryIDAbsent
+	}
+	w.Header().Set("Content-Type", "application/vnd.duckdb")
+	w.Write(wire.EncodeEnvelope(hdr, body))
+}
+
+func (s *Server) errorReply(w http.ResponseWriter, msg string) {
+	s.reply(w, wire.Header{Type: wire.MsgError}, wire.ErrorMessage{Message: msg}.Encode())
+}
+
+func (s *Server) withConn(w http.ResponseWriter, hdr wire.Header, h func()) {
 	s.mu.Lock()
-	ok := s.sessions[sid]
+	ok := s.conns[hdr.ConnectionID]
 	s.mu.Unlock()
 	if !ok {
-		jsonError(w, http.StatusForbidden, "unknown session")
+		s.errorReply(w, "Connection does not exist / already disconnected")
 		return
 	}
-	h(w, r)
+	h()
 }
 
-func (s *Server) handleConnect(w http.ResponseWriter) {
+func (s *Server) handleConnect(w http.ResponseWriter, body []byte) {
+	req, err := wire.DecodeConnectionRequest(body)
+	if err != nil {
+		s.errorReply(w, err.Error())
+		return
+	}
+	s.mu.Lock()
+	if s.ConnectFails > 0 {
+		s.ConnectFails--
+		s.mu.Unlock()
+		http.Error(w, "transient", http.StatusServiceUnavailable)
+		return
+	}
+	s.mu.Unlock()
+	if req.MinVersion > 1 {
+		s.errorReply(w, "Unsupported Quack version - server only supports version 1 of quack")
+		return
+	}
+	if req.AuthString != s.Token {
+		// Echo the credential like a badly-behaved server would.
+		s.errorReply(w, "Authentication failed for token "+req.AuthString)
+		return
+	}
 	s.mu.Lock()
 	s.nextID++
-	sid := "s-" + strconv.Itoa(s.nextID)
-	s.sessions[sid] = true
-	s.activeSess++
+	id := "TESTCONN" + strconv.Itoa(s.nextID)
+	s.conns[id] = true
+	s.activeConn++
 	s.mu.Unlock()
-	json.NewEncoder(w).Encode(map[string]any{
-		"session_id":            sid,
-		"protocol_version":      s.ProtocolVersion,
-		"serialization_version": 1,
-		"server_version":        "quack_serve/1.5.3 (quacktest)",
-	})
+	s.reply(w,
+		wire.Header{Type: wire.MsgConnectionResponse, ConnectionID: id},
+		wire.ConnectionResponse{
+			ServerVersion: "v1.5.4-quacktest",
+			Platform:      "test",
+			QuackVersion:  s.QuackVersion,
+		}.Encode(),
+	)
 }
 
-func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
-	sid := r.Header.Get("X-Quack-Session")
+func (s *Server) handleDisconnect(w http.ResponseWriter, hdr wire.Header) {
 	s.mu.Lock()
-	delete(s.sessions, sid)
-	s.activeSess--
+	ok := s.conns[hdr.ConnectionID]
+	if ok {
+		delete(s.conns, hdr.ConnectionID)
+		s.activeConn--
+	}
 	s.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
+	if !ok {
+		s.errorReply(w, "Connection does not exist / already disconnected")
+		return
+	}
+	s.reply(w, wire.Header{Type: wire.MsgSuccess}, wire.EncodeEmptyBody())
 }
 
-func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		SQL string `json:"sql"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, http.StatusBadRequest, "bad request body")
+func (s *Server) handlePrepare(w http.ResponseWriter, hdr wire.Header, body []byte) {
+	req, err := wire.DecodePrepareRequest(body)
+	if err != nil {
+		s.errorReply(w, err.Error())
 		return
 	}
 	s.mu.Lock()
-	res, ok := s.results[body.SQL]
+	res, ok := s.results[req.SQL]
 	if !ok {
 		s.mu.Unlock()
-		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Parser Error: no canned result for %q", body.SQL))
+		s.errorReply(w, "Parser Error: no canned result for "+strconv.Quote(req.SQL))
 		return
 	}
 	s.nextID++
-	qid := "q-" + strconv.Itoa(s.nextID)
-	s.queries[qid] = res
-	s.activeQuery++
+	uuid := qser.Hugeint{Upper: 0x7e57, Lower: uint64(s.nextID)}
+	var inline [][]codectest.Col
+	if len(res.batches) > 0 {
+		inline = res.batches[0]
+	}
+	needsMore := len(res.batches) > 1
+	if needsMore {
+		s.live[uuid] = &liveResult{res: res, next: 1}
+	}
 	s.mu.Unlock()
-	json.NewEncoder(w).Encode(map[string]any{
-		"query_id":    qid,
-		"chunk_count": len(res.chunks),
-		"schema":      res.schema,
-	})
+	s.reply(w,
+		wire.Header{Type: wire.MsgPrepareResponse, QueryID: hdr.QueryID},
+		codectest.EncodePrepareBody(res.cols, inline, needsMore, uuid),
+	)
 }
 
-func (s *Server) handleQuerySub(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/quack/v1/query/")
-	parts := strings.Split(rest, "/")
-	s.mu.Lock()
-	res, ok := s.queries[parts[0]]
-	s.mu.Unlock()
-	if !ok {
-		jsonError(w, http.StatusNotFound, "unknown query")
+func (s *Server) handleFetch(w http.ResponseWriter, body []byte) {
+	req, err := wire.DecodeFetchRequest(body)
+	if err != nil {
+		s.errorReply(w, err.Error())
 		return
 	}
-	switch {
-	case r.Method == http.MethodDelete && len(parts) == 1:
-		s.mu.Lock()
-		delete(s.queries, parts[0])
-		s.activeQuery--
-		s.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-	case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "chunk":
-		idx, err := strconv.Atoi(parts[2])
-		if err != nil || idx < 0 || idx >= len(res.chunks) {
-			jsonError(w, http.StatusNotFound, "chunk index out of range")
-			return
-		}
-		if s.ChunkDelay > 0 {
-			time.Sleep(s.ChunkDelay)
-		}
-		key := parts[0] + "/" + parts[2]
-		s.mu.Lock()
-		s.fetchCount++
-		fails := s.chunkFails[key]
-		if fails < s.FailFirst {
-			s.chunkFails[key] = fails + 1
-			s.mu.Unlock()
-			jsonError(w, http.StatusServiceUnavailable, "transient")
-			return
-		}
-		s.mu.Unlock()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(res.chunks[idx])
-	default:
-		jsonError(w, http.StatusNotFound, "no such endpoint")
+	if s.FetchDelay > 0 {
+		time.Sleep(s.FetchDelay)
 	}
+	s.mu.Lock()
+	s.fetchCount++
+	if s.FetchFails > 0 {
+		s.FetchFails--
+		s.mu.Unlock()
+		http.Error(w, "transient", http.StatusServiceUnavailable)
+		return
+	}
+	lr := s.live[req.UUID]
+	var batch [][]codectest.Col
+	idx := uint64(qser.OptionalIdxAbsent)
+	if lr != nil && lr.next < len(lr.res.batches) {
+		batch = lr.res.batches[lr.next]
+		idx = uint64(lr.next)
+		lr.next++
+	}
+	s.mu.Unlock()
+	s.reply(w,
+		wire.Header{Type: wire.MsgFetchResponse},
+		codectest.EncodeFetchBody(batch, idx),
+	)
 }

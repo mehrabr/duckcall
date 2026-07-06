@@ -94,21 +94,21 @@ func TestSessionPooling(t *testing.T) {
 	if err := c1.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if up.OpenSessions() != 1 {
-		t.Fatalf("upstream sessions after close: %d (want 1 pooled)", up.OpenSessions())
+	if up.OpenConnections() != 1 {
+		t.Fatalf("upstream connections after close: %d (want 1 pooled)", up.OpenConnections())
 	}
 	if pl.idleCount() != 1 {
 		t.Fatalf("pool idle: %d", pl.idleCount())
 	}
 
-	// The next client must reuse the pooled upstream session.
+	// The next client must reuse the pooled upstream connection.
 	c2, err := duckcall.Dial(ctx, duckcall.Config{Endpoint: front.URL, Token: "alice-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c2.Close(ctx)
-	if up.OpenSessions() != 1 {
-		t.Fatalf("upstream sessions after reuse: %d", up.OpenSessions())
+	if up.OpenConnections() != 1 {
+		t.Fatalf("upstream connections after reuse: %d", up.OpenConnections())
 	}
 }
 
@@ -128,7 +128,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	for _, want := range []string{
 		`quackbouncer_requests_total{route="connect",code="200"} 1`,
-		"quackbouncer_active_sessions 1",
+		"quackbouncer_active_connections 1",
 		"quackbouncer_upstream_connects_total 1",
 	} {
 		if !strings.Contains(string(body), want) {

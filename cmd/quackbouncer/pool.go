@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/mehrabr/duckcall/wire"
 )
@@ -38,8 +39,10 @@ func (p *pool) get(ctx context.Context) (*wire.Client, bool, error) {
 	return c, false, err
 }
 
-// put returns a session to the pool, closing it if the pool is full.
-func (p *pool) put(ctx context.Context, c *wire.Client) {
+// put returns a connection to the pool, closing it if the pool is full.
+// The goodbye gets its own bounded context: the caller's request context is
+// usually done by now.
+func (p *pool) put(c *wire.Client) {
 	p.mu.Lock()
 	if len(p.idle) < p.max {
 		p.idle = append(p.idle, c)
@@ -47,6 +50,8 @@ func (p *pool) put(ctx context.Context, c *wire.Client) {
 		return
 	}
 	p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	c.Close(ctx)
 }
 

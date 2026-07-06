@@ -8,7 +8,8 @@ import (
 // retry runs fn until it succeeds, reports a non-retryable failure, or the
 // attempt budget runs out. Backoff doubles from RetryBaseDelay. Only
 // idempotent operations may come through here — in this protocol that is
-// chunk fetches, which are keyed GETs.
+// the connect handshake alone: fetches are destructive reads and prepares
+// re-execute the query.
 func (c *Client) retry(ctx context.Context, fn func() (retryable bool, err error)) error {
 	delay := c.cfg.RetryBaseDelay
 	var lastErr error

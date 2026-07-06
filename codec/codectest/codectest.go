@@ -1,9 +1,8 @@
-// Package codectest encodes schemas and chunks in the wire serialization,
-// for tests, fuzz seeds, and fake servers. duckcall itself never encodes
-// result payloads — a read-only client has no reason to — so the encoder
-// lives here, out of the production tree, and doubles as the round-trip
-// oracle for codec until a captured corpus from a real quack_serve replaces
-// synthetic fixtures.
+// Package codectest encodes logical types and chunks in the wire
+// serialization, for tests, fuzz seeds, and fake servers. duckcall itself
+// never encodes result payloads — a read-only client has no reason to — so
+// the encoder lives here, out of the production tree, and doubles as the
+// round-trip oracle for codec alongside the captured corpus in testdata.
 package codectest
 
 import (
@@ -34,89 +33,141 @@ func DecimalT(width, scale uint8) codec.LogicalType {
 	return codec.LogicalType{ID: codec.TypeDecimal, Width: width, Scale: scale}
 }
 
-// Field ids duplicated from codec's decode tables; codec keeps them
+// Type info kinds, duplicated from codec's decode tables; codec keeps them
 // unexported so its public surface stays decode-only.
 const (
-	ftID     = 1
-	ftWidth  = 2
-	ftScale  = 3
-	ftChild  = 4
-	ftFields = 5
-	ftName   = 1
-	ftType   = 2
-
-	fsColumns = 1
-
-	fcRows    = 1
-	fcColumns = 2
-
-	fvType     = 1
-	fvValidity = 2
-	fvData     = 3
-	fvHeap     = 4
+	infoDecimal = 2
+	infoList    = 4
+	infoStruct  = 5
+	infoEnum    = 6
+	infoArray   = 9
 )
 
-func writeType(w *qser.Writer, id uint64, t codec.LogicalType) {
-	w.FieldObject(id)
-	w.FieldUvarint(ftID, uint64(t.ID))
-	if t.ID == codec.TypeDecimal {
-		w.FieldUvarint(ftWidth, uint64(t.Width))
-		w.FieldUvarint(ftScale, uint64(t.Scale))
-	}
-	if t.Child != nil {
-		writeType(w, ftChild, *t.Child)
-	}
-	if len(t.Fields) > 0 {
-		w.FieldList(ftFields, uint64(len(t.Fields)))
+// WriteType appends one serialized LogicalType object (contents plus
+// terminator) — the element form used inside type lists.
+func WriteType(w *qser.Writer, t codec.LogicalType) {
+	w.FieldUvarint(100, uint64(t.ID))
+	switch t.ID {
+	case codec.TypeDecimal:
+		w.Field(101)
+		w.Bool(true)
+		w.FieldUvarint(100, infoDecimal)
+		if t.Width != 0 {
+			w.FieldUvarint(200, uint64(t.Width))
+		}
+		if t.Scale != 0 {
+			w.FieldUvarint(201, uint64(t.Scale))
+		}
+		w.End()
+	case codec.TypeList, codec.TypeMap:
+		w.Field(101)
+		w.Bool(true)
+		w.FieldUvarint(100, infoList)
+		w.Field(200)
+		WriteType(w, *t.Child)
+		w.End()
+	case codec.TypeStruct:
+		w.Field(101)
+		w.Bool(true)
+		w.FieldUvarint(100, infoStruct)
+		w.Field(200)
+		w.Uvarint(uint64(len(t.Fields)))
 		for _, f := range t.Fields {
-			w.FieldBytes(ftName, []byte(f.Name))
-			writeType(w, ftType, f.Type)
+			w.FieldString(0, f.Name)
+			w.Field(1)
+			WriteType(w, f.Type)
 			w.End()
 		}
-	}
-	w.End()
-}
-
-// EncodeSchema builds a schema payload from column names and types.
-func EncodeSchema(cols []Col) []byte {
-	var w qser.Writer
-	w.FieldList(fsColumns, uint64(len(cols)))
-	for _, c := range cols {
-		w.FieldBytes(ftName, []byte(c.Name))
-		writeType(&w, ftType, c.Type)
+		w.End()
+	case codec.TypeEnum:
+		w.Field(101)
+		w.Bool(true)
+		w.FieldUvarint(100, infoEnum)
+		w.FieldUvarint(200, uint64(len(t.Enum)))
+		w.Field(201)
+		w.Uvarint(uint64(len(t.Enum)))
+		for _, v := range t.Enum {
+			w.String(v)
+		}
+		w.End()
+	case codec.TypeArray:
+		w.Field(101)
+		w.Bool(true)
+		w.FieldUvarint(100, infoArray)
+		w.Field(200)
+		WriteType(w, *t.Child)
+		if t.ArraySize != 0 {
+			w.FieldUvarint(201, uint64(t.ArraySize))
+		}
 		w.End()
 	}
 	w.End()
+}
+
+// EncodeChunk builds one serialized DataChunk (contents plus terminator,
+// the form living inside a wrapper's field 300). All columns must have the
+// same number of values.
+func EncodeChunk(cols []Col) []byte {
+	var w qser.Writer
+	WriteChunk(&w, cols)
 	return w.Bytes()
 }
 
-// EncodeChunk builds a DataChunk payload. All columns must have the same
-// number of values.
-func EncodeChunk(cols []Col) []byte {
+// WriteChunk appends a serialized DataChunk to an existing writer.
+func WriteChunk(w *qser.Writer, cols []Col) {
 	rows := 0
 	if len(cols) > 0 {
 		rows = len(cols[0].Vals)
 	}
-	var w qser.Writer
-	w.FieldUvarint(fcRows, uint64(rows))
-	w.FieldList(fcColumns, uint64(len(cols)))
+	w.FieldUvarint(100, uint64(rows))
+	w.Field(101)
+	w.Uvarint(uint64(len(cols)))
+	for _, c := range cols {
+		WriteType(w, c.Type)
+	}
+	w.Field(102)
+	w.Uvarint(uint64(len(cols)))
 	for _, c := range cols {
 		if len(c.Vals) != rows {
 			panic(fmt.Sprintf("codectest: column %q has %d values, want %d", c.Name, len(c.Vals), rows))
 		}
-		writeType(&w, fvType, c.Type)
-		if validity := validityMask(c.Vals); validity != nil {
-			w.FieldBytes(fvValidity, validity)
-		}
-		data, heap := encodeVector(c.Type, c.Vals)
-		w.FieldBytes(fvData, data)
-		if heap != nil {
-			w.FieldBytes(fvHeap, heap)
-		}
+		writeVector(w, c.Type, c.Vals)
 		w.End()
 	}
 	w.End()
-	return w.Bytes()
+}
+
+// writeVector appends flat vector fields (no terminator; the caller ends
+// the list element).
+func writeVector(w *qser.Writer, t codec.LogicalType, vals []any) {
+	validity := validityMask(vals)
+	w.FieldBool(100, validity != nil)
+	if validity != nil {
+		w.FieldBytes(101, validity)
+	}
+	switch t.ID {
+	case codec.TypeVarchar, codec.TypeBlob:
+		w.Field(102)
+		w.Uvarint(uint64(len(vals)))
+		for _, v := range vals {
+			switch s := v.(type) {
+			case nil:
+				w.String("")
+			case string:
+				w.String(s)
+			case []byte:
+				w.BytesVal(s)
+			default:
+				panic(fmt.Sprintf("codectest: string column got %T", v))
+			}
+		}
+	default:
+		var data []byte
+		for _, v := range vals {
+			data = appendCell(data, t, v)
+		}
+		w.FieldBytes(102, data)
+	}
 }
 
 func validityMask(vals []any) []byte {
@@ -130,24 +181,15 @@ func validityMask(vals []any) []byte {
 	if !hasNull {
 		return nil
 	}
-	mask := make([]byte, (len(vals)+7)/8)
+	// The server pads masks to 8-byte entries; match it so fixtures look
+	// like the wire.
+	mask := make([]byte, (len(vals)+63)/64*8)
 	for i, v := range vals {
 		if v != nil {
 			mask[i/8] |= 1 << (i % 8)
 		}
 	}
 	return mask
-}
-
-func encodeVector(t codec.LogicalType, vals []any) (data, heap []byte) {
-	switch t.ID {
-	case codec.TypeVarchar, codec.TypeBlob:
-		return encodeStrings(vals)
-	}
-	for _, v := range vals {
-		data = appendCell(data, t, v)
-	}
-	return data, nil
 }
 
 func appendCell(data []byte, t codec.LogicalType, v any) []byte {
@@ -187,7 +229,8 @@ func appendCell(data []byte, t codec.LogicalType, v any) []byte {
 		return le.AppendUint32(data, uint32(int32(days)))
 	case codec.TypeTime:
 		return le.AppendUint64(data, uint64(nz[codec.Time](v)))
-	case codec.TypeTimestampSec, codec.TypeTimestampMS, codec.TypeTimestamp, codec.TypeTimestampNS:
+	case codec.TypeTimestampSec, codec.TypeTimestampMS, codec.TypeTimestamp,
+		codec.TypeTimestampNS, codec.TypeTimestampTZ:
 		var n int64
 		if v != nil {
 			ts := v.(time.Time)
@@ -205,6 +248,29 @@ func appendCell(data []byte, t codec.LogicalType, v any) []byte {
 		return le.AppendUint64(data, uint64(n))
 	case codec.TypeDecimal:
 		return appendDecimal(data, t, v)
+	case codec.TypeEnum:
+		var idx int
+		if v != nil {
+			s := v.(string)
+			idx = -1
+			for i, e := range t.Enum {
+				if e == s {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				panic(fmt.Sprintf("codectest: %q not in enum dictionary", s))
+			}
+		}
+		switch {
+		case len(t.Enum) <= math.MaxUint8:
+			return append(data, byte(idx))
+		case len(t.Enum) <= math.MaxUint16:
+			return le.AppendUint16(data, uint16(idx))
+		default:
+			return le.AppendUint32(data, uint32(idx))
+		}
 	}
 	panic(fmt.Sprintf("codectest: cannot encode type %s", t))
 }
@@ -248,29 +314,54 @@ func int128parts(v *big.Int) (hi int64, lo uint64) {
 	return int64(new(big.Int).Rsh(b, 64).Uint64()), b.Uint64()
 }
 
-func encodeStrings(vals []any) (data, heap []byte) {
-	le := binary.LittleEndian
-	for _, v := range vals {
-		var b []byte
-		switch s := v.(type) {
-		case nil:
-		case string:
-			b = []byte(s)
-		case []byte:
-			b = s
-		default:
-			panic(fmt.Sprintf("codectest: string column got %T", v))
+// EncodePrepareBody assembles a full PREPARE_RESPONSE body: schema from the
+// column definitions, inline chunks, and the fetch handle. Fake servers
+// compose messages from this plus wire's envelope helpers.
+func EncodePrepareBody(cols []Col, inline [][]Col, needsMore bool, uuid qser.Hugeint) []byte {
+	var w qser.Writer
+	if len(cols) > 0 {
+		w.Field(1)
+		w.Uvarint(uint64(len(cols)))
+		for _, c := range cols {
+			WriteType(&w, c.Type)
 		}
-		entry := make([]byte, 16)
-		le.PutUint32(entry[:4], uint32(len(b)))
-		if len(b) <= 12 {
-			copy(entry[4:], b)
-		} else {
-			copy(entry[4:8], b[:4])
-			le.PutUint64(entry[8:16], uint64(len(heap)))
-			heap = append(heap, b...)
+		w.Field(2)
+		w.Uvarint(uint64(len(cols)))
+		for _, c := range cols {
+			w.String(c.Name)
 		}
-		data = append(data, entry...)
 	}
-	return data, heap
+	if needsMore {
+		w.FieldBool(3, true)
+	}
+	if len(inline) > 0 {
+		w.Field(4)
+		writeChunkList(&w, inline)
+	}
+	w.FieldHugeint(5, uuid)
+	w.End()
+	return w.Bytes()
+}
+
+// EncodeFetchBody assembles a FETCH_RESPONSE body. Empty chunks means
+// drained.
+func EncodeFetchBody(chunks [][]Col, batchIndex uint64) []byte {
+	var w qser.Writer
+	if len(chunks) > 0 {
+		w.Field(1)
+		writeChunkList(&w, chunks)
+	}
+	w.FieldUvarint(2, batchIndex)
+	w.End()
+	return w.Bytes()
+}
+
+func writeChunkList(w *qser.Writer, chunks [][]Col) {
+	w.Uvarint(uint64(len(chunks)))
+	for _, cols := range chunks {
+		w.Bool(true) // non-null wrapper pointer
+		w.Field(300)
+		WriteChunk(w, cols)
+		w.End() // wrapper object
+	}
 }

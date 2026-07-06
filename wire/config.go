@@ -19,14 +19,18 @@ type Config struct {
 	// out of URLs, and redacted from every error this package returns.
 	Token string
 
-	// FetchWorkers caps concurrent chunk fetches per result. 0 means 4.
+	// FetchWorkers caps concurrent batch fetches per result. The server
+	// hands out batches to competing requests, so workers scale throughput
+	// without coordination. 0 means 4.
 	FetchWorkers int
 
 	// ConnectTimeout bounds the connect/auth exchange. 0 means 10s.
 	ConnectTimeout time.Duration
 
-	// MaxRetries is how many times an idempotent fetch is retried after a
-	// network error or retryable status. 0 means 3; negative disables.
+	// MaxRetries is how many times the connect handshake is retried after a
+	// network error or retryable status. Nothing else retries: a fetch is a
+	// destructive read and re-running a query is the caller's decision.
+	// 0 means 3; negative disables.
 	MaxRetries int
 
 	// RetryBaseDelay is the first backoff step, doubling per attempt.

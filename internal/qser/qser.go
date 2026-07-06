@@ -1,218 +1,266 @@
-// Package qser holds the low-level binary framing shared by codec's reader
-// and codectest's writer: field-tagged objects in the style of DuckDB's
-// BinarySerializer. Fields are (id uvarint, kind byte, payload); id 0 ends
-// an object. The kind byte is what lets a decoder skip fields it does not
-// know, which the protocol requires since extensions may add messages.
+// Package qser reads and writes DuckDB's BinarySerializer framing, the
+// encoding every Quack message rides in: little-endian uint16 field ids,
+// LEB128 varints, length-prefixed strings, nested objects terminated by
+// 0xFFFF, and fields omitted entirely when they hold their default value.
+//
+// There is no wire-type byte, so decoding is schema-driven: the caller must
+// know each field's value encoding, and an unknown field cannot be skipped.
+// That is upstream's contract (serialization compatibility is version-gated),
+// and it is why every decoder built on this package fails loudly rather than
+// guessing.
 package qser
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 )
 
-// Field payload kinds.
-const (
-	KindUvarint byte = 1 // unsigned LEB128
-	KindVarint  byte = 2 // zigzag LEB128
-	KindFixed4  byte = 3 // 4 bytes little-endian
-	KindFixed8  byte = 4 // 8 bytes little-endian
-	KindBytes   byte = 5 // uvarint length + raw bytes
-	KindObject  byte = 6 // nested fields until id 0
-	KindList    byte = 7 // uvarint count + that many objects
-)
+// EndID terminates an object (BinarySerializer's MESSAGE_TERMINATOR_FIELD_ID).
+const EndID uint16 = 0xFFFF
 
 var (
 	ErrTruncated = errors.New("qser: truncated input")
 	ErrOverflow  = errors.New("qser: varint overflow")
 )
 
-// Reader consumes a single serialized buffer. All methods are bounds-checked;
-// a fuzzer drives these paths, so no read may assume well-formed input.
+// Hugeint is duckdb's hugeint_t as serialized: signed upper, unsigned lower.
+type Hugeint struct {
+	Upper int64
+	Lower uint64
+}
+
+// OptionalIdxAbsent is how duckdb serializes an unset optional_idx.
+const OptionalIdxAbsent = math.MaxUint64
+
+// Reader consumes one serialized document. Errors are sticky: after the
+// first failure every method returns zero values and Err() reports the
+// cause, so decoders read straight through and check once. All reads are
+// bounds-checked; a fuzzer drives these paths, so no read may assume
+// well-formed input.
 type Reader struct {
 	buf []byte
 	off int
+	err error
 }
 
 func NewReader(buf []byte) *Reader { return &Reader{buf: buf} }
 
+func (r *Reader) Err() error     { return r.err }
 func (r *Reader) Remaining() int { return len(r.buf) - r.off }
 
-func (r *Reader) Uvarint() (uint64, error) {
-	v, n := binary.Uvarint(r.buf[r.off:])
-	if n == 0 {
-		return 0, ErrTruncated
+// Rest returns the unconsumed tail without copying.
+func (r *Reader) Rest() []byte { return r.buf[r.off:] }
+
+func (r *Reader) fail(err error) {
+	if r.err == nil {
+		r.err = err
 	}
-	if n < 0 {
-		return 0, ErrOverflow
-	}
-	r.off += n
-	return v, nil
 }
 
-func (r *Reader) Varint() (int64, error) {
-	u, err := r.Uvarint()
-	if err != nil {
-		return 0, err
+// PeekID returns the next field id without consuming it.
+func (r *Reader) PeekID() uint16 {
+	if r.err != nil {
+		return EndID
 	}
-	// zigzag
-	return int64(u>>1) ^ -int64(u&1), nil
+	if r.Remaining() < 2 {
+		r.fail(ErrTruncated)
+		return EndID
+	}
+	return binary.LittleEndian.Uint16(r.buf[r.off:])
 }
 
-func (r *Reader) Fixed4() (uint32, error) {
-	b, err := r.Take(4)
-	if err != nil {
-		return 0, err
+// TryField consumes the next field id if it equals id. This is how optional
+// (WritePropertyWithDefault) fields decode: absent means default.
+func (r *Reader) TryField(id uint16) bool {
+	if r.PeekID() != id || r.err != nil {
+		return false
 	}
-	return binary.LittleEndian.Uint32(b), nil
+	r.off += 2
+	return true
 }
 
-func (r *Reader) Fixed8() (uint64, error) {
-	b, err := r.Take(8)
-	if err != nil {
-		return 0, err
+// End consumes an object terminator; anything else is a framing error,
+// usually an unknown field this decoder has no schema for.
+func (r *Reader) End() {
+	id := r.PeekID()
+	if r.err != nil {
+		return
 	}
-	return binary.LittleEndian.Uint64(b), nil
+	if id != EndID {
+		r.fail(fmt.Errorf("qser: unexpected field %d where object should end", id))
+		return
+	}
+	r.off += 2
 }
 
-// Take returns the next n bytes without copying. The returned slice aliases
-// the input buffer.
-func (r *Reader) Take(n int) ([]byte, error) {
+func (r *Reader) Take(n int) []byte {
+	if r.err != nil {
+		return nil
+	}
 	if n < 0 || r.Remaining() < n {
-		return nil, ErrTruncated
+		r.fail(ErrTruncated)
+		return nil
 	}
 	b := r.buf[r.off : r.off+n]
 	r.off += n
-	return b, nil
+	return b
 }
 
-func (r *Reader) Bytes() ([]byte, error) {
-	n, err := r.Uvarint()
-	if err != nil {
-		return nil, err
+// Uvarint reads an unsigned LEB128.
+func (r *Reader) Uvarint() uint64 {
+	if r.err != nil {
+		return 0
+	}
+	v, n := binary.Uvarint(r.buf[r.off:])
+	if n == 0 {
+		r.fail(ErrTruncated)
+		return 0
+	}
+	if n < 0 {
+		r.fail(ErrOverflow)
+		return 0
+	}
+	r.off += n
+	return v
+}
+
+// Svarint reads a signed (sign-extended, not zigzag) LEB128, the encoding
+// duckdb uses for signed integer types.
+func (r *Reader) Svarint() int64 {
+	if r.err != nil {
+		return 0
+	}
+	var v uint64
+	var shift uint
+	for i := 0; ; i++ {
+		if r.Remaining() == 0 {
+			r.fail(ErrTruncated)
+			return 0
+		}
+		if i == 10 {
+			r.fail(ErrOverflow)
+			return 0
+		}
+		b := r.buf[r.off]
+		r.off++
+		if shift < 64 {
+			v |= uint64(b&0x7f) << shift
+		}
+		shift += 7
+		if b&0x80 == 0 {
+			if shift < 64 && b&0x40 != 0 {
+				v |= ^uint64(0) << shift
+			}
+			return int64(v)
+		}
+	}
+}
+
+// Bool is a raw byte; duckdb writes bools uncompressed.
+func (r *Reader) Bool() bool {
+	b := r.Take(1)
+	return len(b) == 1 && b[0] != 0
+}
+
+// Bytes reads a uvarint length prefix and that many bytes, aliasing the
+// input buffer.
+func (r *Reader) Bytes() []byte {
+	n := r.Uvarint()
+	if r.err != nil {
+		return nil
 	}
 	if n > uint64(r.Remaining()) {
-		return nil, ErrTruncated
+		r.fail(ErrTruncated)
+		return nil
 	}
 	return r.Take(int(n))
 }
 
-// Field reads the next field header. id 0 means end-of-object and kind is
-// meaningless.
-func (r *Reader) Field() (id uint64, kind byte, err error) {
-	id, err = r.Uvarint()
-	if err != nil || id == 0 {
-		return id, 0, err
+func (r *Reader) String() string { return string(r.Bytes()) }
+
+// ListCount reads a list's element count, bounded by what could possibly
+// fit in the remaining input.
+func (r *Reader) ListCount() int {
+	n := r.Uvarint()
+	if r.err != nil {
+		return 0
 	}
-	k, err := r.Take(1)
-	if err != nil {
-		return 0, 0, err
+	if n > uint64(r.Remaining()) {
+		r.fail(ErrTruncated)
+		return 0
 	}
-	return id, k[0], nil
+	return int(n)
 }
 
-// Skip discards a value of the given kind, recursing through objects and
-// lists so unknown fields never desync the stream.
-func (r *Reader) Skip(kind byte) error {
-	switch kind {
-	case KindUvarint, KindVarint:
-		_, err := r.Uvarint()
-		return err
-	case KindFixed4:
-		_, err := r.Take(4)
-		return err
-	case KindFixed8:
-		_, err := r.Take(8)
-		return err
-	case KindBytes:
-		_, err := r.Bytes()
-		return err
-	case KindObject:
-		return r.SkipObject()
-	case KindList:
-		n, err := r.Uvarint()
-		if err != nil {
-			return err
-		}
-		if n > uint64(r.Remaining()) {
-			return ErrTruncated
-		}
-		for range n {
-			if err := r.SkipObject(); err != nil {
-				return err
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("qser: unknown field kind %d", kind)
-	}
+// Present reads a nullable marker (OnNullableBegin's bool).
+func (r *Reader) Present() bool { return r.Bool() }
+
+func (r *Reader) Hugeint() Hugeint {
+	return Hugeint{Upper: r.Svarint(), Lower: r.Uvarint()}
 }
 
-func (r *Reader) SkipObject() error {
-	for {
-		id, kind, err := r.Field()
-		if err != nil {
-			return err
-		}
-		if id == 0 {
-			return nil
-		}
-		if err := r.Skip(kind); err != nil {
-			return err
-		}
-	}
-}
+// OptionalIdx reads duckdb's optional_idx: a uvarint whose max value means
+// absent. Callers compare against OptionalIdxAbsent.
+func (r *Reader) OptionalIdx() uint64 { return r.Uvarint() }
 
-// Writer builds buffers in the same framing. It exists for codectest and the
-// fuzz seeds; production duckcall never encodes result payloads.
+// Writer builds documents in the same framing. Optional fields are the
+// caller's concern: to match duckdb, skip the field entirely when the value
+// is its default.
 type Writer struct {
 	buf []byte
 }
 
 func (w *Writer) Bytes() []byte { return w.buf }
 
-func (w *Writer) uvarint(v uint64) { w.buf = binary.AppendUvarint(w.buf, v) }
+func (w *Writer) Field(id uint16) { w.buf = binary.LittleEndian.AppendUint16(w.buf, id) }
+func (w *Writer) End()            { w.Field(EndID) }
 
-func (w *Writer) field(id uint64, kind byte) {
-	w.uvarint(id)
-	w.buf = append(w.buf, kind)
+func (w *Writer) Uvarint(v uint64) { w.buf = binary.AppendUvarint(w.buf, v) }
+
+func (w *Writer) Svarint(v int64) {
+	for {
+		b := byte(v & 0x7f)
+		v >>= 7
+		if (v == 0 && b&0x40 == 0) || (v == -1 && b&0x40 != 0) {
+			w.buf = append(w.buf, b)
+			return
+		}
+		w.buf = append(w.buf, b|0x80)
+	}
 }
 
-func (w *Writer) FieldUvarint(id, v uint64) {
-	w.field(id, KindUvarint)
-	w.uvarint(v)
+func (w *Writer) Bool(b bool) {
+	if b {
+		w.buf = append(w.buf, 1)
+	} else {
+		w.buf = append(w.buf, 0)
+	}
 }
 
-func (w *Writer) FieldVarint(id uint64, v int64) {
-	w.field(id, KindVarint)
-	w.uvarint(uint64(v<<1) ^ uint64(v>>63))
-}
-
-func (w *Writer) FieldFixed4(id uint64, v uint32) {
-	w.field(id, KindFixed4)
-	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
-}
-
-func (w *Writer) FieldFixed8(id, v uint64) {
-	w.field(id, KindFixed8)
-	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
-}
-
-func (w *Writer) FieldBytes(id uint64, b []byte) {
-	w.field(id, KindBytes)
-	w.uvarint(uint64(len(b)))
+func (w *Writer) BytesVal(b []byte) {
+	w.Uvarint(uint64(len(b)))
 	w.buf = append(w.buf, b...)
 }
 
-// FieldObject opens a nested object; the caller writes its fields and then
-// calls End.
-func (w *Writer) FieldObject(id uint64) { w.field(id, KindObject) }
+func (w *Writer) String(s string) { w.BytesVal([]byte(s)) }
 
-// FieldList opens a list of count objects; each element must be written as
-// fields followed by End.
-func (w *Writer) FieldList(id, count uint64) {
-	w.field(id, KindList)
-	w.uvarint(count)
+func (w *Writer) Raw(b []byte) { w.buf = append(w.buf, b...) }
+
+func (w *Writer) Hugeint(h Hugeint) {
+	w.Svarint(h.Upper)
+	w.Uvarint(h.Lower)
 }
 
-func (w *Writer) End() { w.uvarint(0) }
+// Field-plus-value shorthands for the common cases.
+
+func (w *Writer) FieldUvarint(id uint16, v uint64) { w.Field(id); w.Uvarint(v) }
+func (w *Writer) FieldSvarint(id uint16, v int64)  { w.Field(id); w.Svarint(v) }
+func (w *Writer) FieldBool(id uint16, b bool)      { w.Field(id); w.Bool(b) }
+func (w *Writer) FieldString(id uint16, s string)  { w.Field(id); w.String(s) }
+func (w *Writer) FieldBytes(id uint16, b []byte)   { w.Field(id); w.BytesVal(b) }
+func (w *Writer) FieldHugeint(id uint16, h Hugeint) {
+	w.Field(id)
+	w.Hugeint(h)
+}

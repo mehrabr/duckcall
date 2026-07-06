@@ -6,18 +6,24 @@ import (
 	"strings"
 )
 
-// ServerError is a non-2xx response from the server, message included when
-// the server sent one.
+// ServerError is a failure reported by the server. Quack delivers protocol
+// errors in-band (ERROR_RESPONSE inside HTTP 200), in which case Status is
+// zero; a non-zero Status means the HTTP layer itself refused — a proxy,
+// a wrong endpoint, not a Quack handler.
 type ServerError struct {
 	Status  int
 	Message string
 }
 
 func (e *ServerError) Error() string {
-	if e.Message == "" {
-		return fmt.Sprintf("wire: server returned %d", e.Status)
+	switch {
+	case e.Status == 0:
+		return "wire: server error: " + e.Message
+	case e.Message == "":
+		return fmt.Sprintf("wire: server returned HTTP %d", e.Status)
+	default:
+		return fmt.Sprintf("wire: server returned HTTP %d: %s", e.Status, e.Message)
 	}
-	return fmt.Sprintf("wire: server returned %d: %s", e.Status, e.Message)
 }
 
 // ErrClosed is returned by operations on a closed client.

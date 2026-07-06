@@ -2,6 +2,7 @@ package wire_test
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -36,8 +37,7 @@ func connect(t *testing.T, s *quacktest.Server, mutate func(*wire.Config)) *wire
 	return c
 }
 
-// intCol builds one INTEGER column with n sequential rows, so chunk order is
-// checkable after parallel fetch.
+// intCol builds one INTEGER column with n sequential rows.
 func intCol(n int) []codectest.Col {
 	vals := make([]any, n)
 	for i := range vals {
@@ -46,24 +46,74 @@ func intCol(n int) []codectest.Col {
 	return []codectest.Col{{Name: "i", Type: codectest.T(codec.TypeInteger), Vals: vals}}
 }
 
-func TestConnectAndHandshake(t *testing.T) {
+// The 50-byte CONNECTION_REQUEST DuckDB v1.5.4's CLI sent to a live
+// quack_serve, from testdata/corpus/quack-v1.5.4-capture.txt. The envelope
+// codec must read the real thing, not just its own output.
+const capturedConnect = "010001030004ffff01000a64656d6f2d746f6b656e02000676312e352e34" +
+	"0300096f73785f61726d3634040001050001ffff"
+
+func TestDecodeCapturedConnectionRequest(t *testing.T) {
+	raw, err := hex.DecodeString(strings.ReplaceAll(capturedConnect, " ", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, body, err := wire.SplitEnvelope(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Type != wire.MsgConnectionRequest || hdr.ConnectionID != "" || hdr.QueryID != 4 {
+		t.Fatalf("header: %+v", hdr)
+	}
+	req, err := wire.DecodeConnectionRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := wire.ConnectionRequest{
+		AuthString:    "demo-token",
+		ClientVersion: "v1.5.4",
+		Platform:      "osx_arm64",
+		MinVersion:    1,
+		MaxVersion:    1,
+	}
+	if req != want {
+		t.Fatalf("decoded %+v, want %+v", req, want)
+	}
+	// And the encoder must reproduce the capture byte for byte.
+	reencoded := wire.EncodeEnvelope(hdr, req.Encode())
+	if !strings.EqualFold(hex.EncodeToString(reencoded), strings.ReplaceAll(capturedConnect, " ", "")) {
+		t.Fatalf("re-encoding diverges from capture:\n got %x\nwant %s", reencoded, capturedConnect)
+	}
+}
+
+func TestConnectAndDisconnect(t *testing.T) {
 	s := startServer(t)
 	c := connect(t, s, nil)
-	hs := c.Handshake()
-	if hs.ProtocolVersion != 1 || hs.SessionID == "" {
-		t.Fatalf("handshake: %+v", hs)
+	if v := c.Server().QuackVersion; v != 1 {
+		t.Fatalf("negotiated quack version %d", v)
 	}
-	if s.OpenSessions() != 1 {
-		t.Fatalf("server sees %d sessions", s.OpenSessions())
+	if c.ConnectionID() == "" {
+		t.Fatal("no connection id")
+	}
+	if s.OpenConnections() != 1 {
+		t.Fatalf("server sees %d connections", s.OpenConnections())
 	}
 	if err := c.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if s.OpenSessions() != 0 {
-		t.Fatal("session not released on server")
+	if s.OpenConnections() != 0 {
+		t.Fatal("connection not released on server")
 	}
-	if _, err := c.Execute(context.Background(), "SELECT 1"); !errors.Is(err, wire.ErrClosed) {
+	if _, err := c.Prepare(context.Background(), "SELECT 1"); !errors.Is(err, wire.ErrClosed) {
 		t.Fatalf("want ErrClosed, got %v", err)
+	}
+}
+
+func TestConnectRetriesTransientFailures(t *testing.T) {
+	s := startServer(t)
+	s.ConnectFails = 2
+	c := connect(t, s, func(cfg *wire.Config) { cfg.RetryBaseDelay = time.Millisecond })
+	if c.ConnectionID() == "" {
+		t.Fatal("no connection id after retried connect")
 	}
 }
 
@@ -74,8 +124,8 @@ func TestBadTokenRedacted(t *testing.T) {
 		t.Fatal("connect succeeded with bad token")
 	}
 	var se *wire.ServerError
-	if !errors.As(err, &se) || se.Status != 401 {
-		t.Fatalf("want 401 ServerError, got %v", err)
+	if !errors.As(err, &se) || se.Status != 0 {
+		t.Fatalf("want in-band ServerError, got %v", err)
 	}
 	// quacktest echoes the presented token; the client must have scrubbed it.
 	if strings.Contains(err.Error(), "wrong-token-99") {
@@ -86,152 +136,102 @@ func TestBadTokenRedacted(t *testing.T) {
 	}
 }
 
-func TestProtocolVersionMismatch(t *testing.T) {
+func TestQuackVersionMismatch(t *testing.T) {
 	s := startServer(t)
-	s.ProtocolVersion = 99
+	s.QuackVersion = 99
 	_, err := wire.Connect(context.Background(), wire.Config{Endpoint: s.URL(), Token: testToken})
-	if err == nil || !strings.Contains(err.Error(), "protocol 99") {
+	if err == nil || !strings.Contains(err.Error(), "quack version 99") {
 		t.Fatalf("want version error, got %v", err)
 	}
 }
 
-func TestStreamChunksOrdered(t *testing.T) {
+func TestPrepareAndFetchLoop(t *testing.T) {
 	s := startServer(t)
 	const rows, chunkRows = 1000, 32
 	s.AddResult("SELECT i FROM seq", intCol(rows), chunkRows)
-	c := connect(t, s, func(cfg *wire.Config) { cfg.FetchWorkers = 8 })
-
-	res, err := c.Execute(context.Background(), "SELECT i FROM seq")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantChunks := (rows + chunkRows - 1) / chunkRows
-	if res.ChunkCount != wantChunks {
-		t.Fatalf("chunk count %d, want %d", res.ChunkCount, wantChunks)
-	}
-
-	cd, _ := codec.For(1, 1)
-	next := 0
-	for payload, err := range c.StreamChunks(context.Background(), res) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		ch, err := cd.DecodeChunk(payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for r := range ch.RowCount() {
-			v, err := ch.Value(0, r)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if v != int32(next) {
-				t.Fatalf("row %d out of order: got %v", next, v)
-			}
-			next++
-		}
-	}
-	if next != rows {
-		t.Fatalf("streamed %d rows, want %d", next, rows)
-	}
-	if err := c.CloseQuery(context.Background(), res.QueryID); err != nil {
-		t.Fatal(err)
-	}
-	if s.OpenQueries() != 0 {
-		t.Fatal("query not released on server")
-	}
-}
-
-func TestFetchRetriesTransientFailures(t *testing.T) {
-	s := startServer(t)
-	s.FailFirst = 2
-	s.AddResult("SELECT i FROM seq", intCol(10), 5)
-	c := connect(t, s, func(cfg *wire.Config) { cfg.RetryBaseDelay = time.Millisecond })
-
-	res, err := c.Execute(context.Background(), "SELECT i FROM seq")
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunks := 0
-	for payload, err := range c.StreamChunks(context.Background(), res) {
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(payload) == 0 {
-			t.Fatal("empty chunk payload")
-		}
-		chunks++
-	}
-	if chunks != 2 {
-		t.Fatalf("streamed %d chunks, want 2", chunks)
-	}
-	// 2 chunks, each failed twice then fetched: 6 server-side fetches.
-	if s.FetchCount() != 6 {
-		t.Fatalf("fetch count %d, want 6", s.FetchCount())
-	}
-}
-
-func TestRetryBudgetExhausted(t *testing.T) {
-	s := startServer(t)
-	s.FailFirst = 100
-	s.AddResult("SELECT i FROM seq", intCol(4), 4)
-	c := connect(t, s, func(cfg *wire.Config) {
-		cfg.RetryBaseDelay = time.Millisecond
-		cfg.MaxRetries = 2
-	})
-	res, err := c.Execute(context.Background(), "SELECT i FROM seq")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var se *wire.ServerError
-	for _, err := range c.StreamChunks(context.Background(), res) {
-		if err == nil {
-			t.Fatal("stream succeeded against a permanently failing chunk")
-		}
-		if !errors.As(err, &se) || se.Status != 503 {
-			t.Fatalf("want 503, got %v", err)
-		}
-		break
-	}
-	if s.FetchCount() != 3 { // initial try + 2 retries
-		t.Fatalf("fetch count %d, want 3", s.FetchCount())
-	}
-}
-
-func TestStreamCancellation(t *testing.T) {
-	s := startServer(t)
-	s.ChunkDelay = 20 * time.Millisecond
-	s.AddResult("SELECT i FROM seq", intCol(1000), 10)
 	c := connect(t, s, nil)
 
-	res, err := c.Execute(context.Background(), "SELECT i FROM seq")
+	body, err := c.Prepare(context.Background(), "SELECT i FROM seq")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	seen := 0
-	for _, err := range c.StreamChunks(ctx, res) {
-		if err != nil {
-			if seen == 0 {
-				t.Fatal("no chunks before cancellation")
+	cd, _ := codec.For(1)
+	pr, err := cd.DecodePrepare(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pr.NeedsMoreFetch {
+		t.Fatal("1000 rows fit inline?")
+	}
+	next := 0
+	countRows := func(chunks []*codec.Chunk) {
+		for _, ch := range chunks {
+			for r := range ch.RowCount() {
+				v, err := ch.Value(0, r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != int32(next) {
+					t.Fatalf("row %d: got %v", next, v)
+				}
+				next++
 			}
-			return // cancellation surfaced as an error, as it should
-		}
-		seen++
-		if seen == 3 {
-			cancel()
 		}
 	}
-	t.Fatal("stream ended without surfacing cancellation")
+	countRows(pr.Chunks)
+	for {
+		body, err := c.Fetch(context.Background(), pr.ResultUUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fr, err := cd.DecodeFetch(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fr.Chunks) == 0 {
+			break
+		}
+		countRows(fr.Chunks)
+	}
+	if next != rows {
+		t.Fatalf("fetched %d rows, want %d", next, rows)
+	}
+}
+
+func TestFetchDoesNotRetry(t *testing.T) {
+	s := startServer(t)
+	s.AddResult("SELECT i FROM seq", intCol(100), 10)
+	c := connect(t, s, func(cfg *wire.Config) { cfg.RetryBaseDelay = time.Millisecond })
+
+	body, err := c.Prepare(context.Background(), "SELECT i FROM seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cd, _ := codec.For(1)
+	pr, err := cd.DecodePrepare(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := s.FetchCount()
+	s.FetchFails = 1
+	_, err = c.Fetch(context.Background(), pr.ResultUUID)
+	var se *wire.ServerError
+	if !errors.As(err, &se) || se.Status != 503 {
+		t.Fatalf("want 503 ServerError, got %v", err)
+	}
+	// A destructive read gets exactly one attempt.
+	if got := s.FetchCount() - before; got != 1 {
+		t.Fatalf("server saw %d fetches, want 1", got)
+	}
 }
 
 func TestQueryError(t *testing.T) {
 	s := startServer(t)
 	c := connect(t, s, nil)
-	_, err := c.Execute(context.Background(), "SELEC typo")
+	_, err := c.Prepare(context.Background(), "SELEC typo")
 	var se *wire.ServerError
-	if !errors.As(err, &se) || se.Status != 400 || !strings.Contains(se.Message, "Parser Error") {
+	if !errors.As(err, &se) || se.Status != 0 || !strings.Contains(se.Message, "Parser Error") {
 		t.Fatalf("want parser error, got %v", err)
 	}
 }

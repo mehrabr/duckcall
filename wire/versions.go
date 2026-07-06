@@ -1,21 +1,22 @@
 package wire
 
-// Version assumptions live here and nowhere else. The endpoint shapes below
-// track duckdb-quack as shipped with DuckDB 1.5.3/1.5.4; the protocol is
-// beta until DuckDB 2.0, so expect this file to change with upstream.
+// Version assumptions live here and nowhere else. Everything below tracks
+// duckdb-quack as shipped with DuckDB 1.5.3/1.5.4 (quack wire version 1);
+// the protocol is beta until DuckDB 2.0, so expect this file to change with
+// upstream.
 
-// Protocol versions this transport can negotiate.
+// Quack protocol versions this transport can negotiate. Sent in the
+// connection request; the server refuses if it cannot serve the minimum.
 const (
-	protocolVersionMin = 1
-	protocolVersionMax = 1
+	quackVersionMin = 1
+	quackVersionMax = 1
 )
 
-// Endpoint paths, relative to the configured base URL.
-const (
-	pathConnect = "/quack/v1/connect"
-	pathSession = "/quack/v1/session"
-	pathQuery   = "/quack/v1/query"
-)
+// The one endpoint. Every message is a POST here; GET / is only a banner.
+const pathRPC = "/quack"
 
-// sessionHeader carries the session id on every request after connect.
-const sessionHeader = "X-Quack-Session"
+// What we announce ourselves as. The server passes these through to its
+// auth hook and logs; they carry no protocol meaning.
+const clientVersion = "duckcall/0.4"
+
+const contentType = "application/octet-stream"

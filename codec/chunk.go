@@ -8,7 +8,8 @@ import (
 	"github.com/mehrabr/duckcall/internal/qser"
 )
 
-// Schema is the decoded result header: column names and types.
+// Schema is the decoded result header: column names and types. On the wire
+// it arrives as two parallel lists in the PREPARE_RESPONSE.
 type Schema struct {
 	Columns []SchemaColumn
 }
@@ -16,56 +17,6 @@ type Schema struct {
 type SchemaColumn struct {
 	Name string
 	Type LogicalType
-}
-
-// Wire field ids for schema, chunk, and vector objects.
-const (
-	fsColumns = 1
-
-	fcRows    = 1
-	fcColumns = 2
-
-	fvType     = 1
-	fvValidity = 2
-	fvData     = 3
-	fvHeap     = 4
-)
-
-// DecodeSchema decodes a result schema payload.
-func (c *Codec) DecodeSchema(buf []byte) (*Schema, error) {
-	r := qser.NewReader(buf)
-	s := &Schema{}
-	for {
-		id, kind, err := r.Field()
-		if err != nil {
-			return nil, err
-		}
-		if id == 0 {
-			return s, nil
-		}
-		switch id {
-		case fsColumns:
-			n, err := r.Uvarint()
-			if err != nil {
-				return nil, err
-			}
-			if n > uint64(r.Remaining()) {
-				return nil, qser.ErrTruncated
-			}
-			s.Columns = make([]SchemaColumn, 0, n)
-			for range n {
-				f, err := decodeStructField(r, 0)
-				if err != nil {
-					return nil, err
-				}
-				s.Columns = append(s.Columns, SchemaColumn{Name: f.Name, Type: f.Type})
-			}
-		default:
-			if err := r.Skip(kind); err != nil {
-				return nil, err
-			}
-		}
-	}
 }
 
 // Chunk is one decoded DataChunk. Columns that this codec version cannot
@@ -107,176 +58,385 @@ func (cl *Column) Err() error { return cl.err }
 
 func (cl *Column) Value(row int) any { return cl.vals[row] }
 
-// DecodeChunk decodes one DataChunk payload. Chunks are self-describing:
-// each vector carries its own type, so a chunk can be decoded without the
-// schema (the schema adds names).
-func (c *Codec) DecodeChunk(buf []byte) (*Chunk, error) {
-	r := qser.NewReader(buf)
-	ch := &Chunk{rows: -1}
-	for {
-		id, kind, err := r.Field()
+// VectorType values a serialized vector can carry in field 90; absent means
+// flat. Compressed forms appear because the server serializes at
+// compatibility >= 5.
+const (
+	vecFlat       = 0
+	vecFSST       = 1
+	vecConstant   = 2
+	vecDictionary = 3
+	vecSequence   = 4
+)
+
+// A duckdb DataChunk holds at most STANDARD_VECTOR_SIZE rows; anything far
+// beyond it is a corrupt or hostile length.
+const maxChunkRows = 1 << 16
+
+// decodeChunkContents reads one DataChunk object's fields: 100 row count,
+// 101 the column types, 102 the vectors. Chunks are self-describing — the
+// types ride in every chunk — so decoding needs no schema.
+func decodeChunkContents(r *qser.Reader) (*Chunk, error) {
+	ch := &Chunk{}
+	if !r.TryField(100) {
+		return nil, fmt.Errorf("codec: chunk missing row count")
+	}
+	rows := r.Uvarint()
+	if rows > maxChunkRows {
+		return nil, fmt.Errorf("codec: implausible row count %d", rows)
+	}
+	ch.rows = int(rows)
+
+	if !r.TryField(101) {
+		return nil, fmt.Errorf("codec: chunk missing types")
+	}
+	ntypes := r.ListCount()
+	types := make([]LogicalType, 0, ntypes)
+	for range ntypes {
+		t, err := decodeType(r, 0)
 		if err != nil {
 			return nil, err
 		}
-		if id == 0 {
-			if ch.rows < 0 {
-				return nil, fmt.Errorf("codec: chunk missing row count")
-			}
-			return ch, nil
-		}
-		switch id {
-		case fcRows:
-			n, err := r.Uvarint()
-			if err != nil {
-				return nil, err
-			}
-			// A duckdb vector is at most 2048 rows; anything bigger is a
-			// corrupt or hostile length.
-			if n > 1<<16 {
-				return nil, fmt.Errorf("codec: implausible row count %d", n)
-			}
-			ch.rows = int(n)
-		case fcColumns:
-			if ch.rows < 0 {
-				return nil, fmt.Errorf("codec: columns before row count")
-			}
-			n, err := r.Uvarint()
-			if err != nil {
-				return nil, err
-			}
-			if n > uint64(r.Remaining()) {
-				return nil, qser.ErrTruncated
-			}
-			ch.cols = make([]Column, 0, n)
-			for range n {
-				col, err := decodeVector(r, ch.rows)
-				if err != nil {
-					return nil, err
-				}
-				ch.cols = append(ch.cols, col)
-			}
+		types = append(types, t)
+	}
+
+	if !r.TryField(102) {
+		return nil, fmt.Errorf("codec: chunk missing columns")
+	}
+	ncols := r.ListCount()
+	if ncols != len(types) {
+		return nil, fmt.Errorf("codec: chunk has %d columns but %d types", ncols, len(types))
+	}
+	ch.cols = make([]Column, 0, ncols)
+	for _, t := range types {
+		col := Column{Type: t}
+		vals, err := decodeVector(r, t, ch.rows, 0)
+		switch {
+		case err == nil:
+			col.vals = vals
+		case isUnsupported(err):
+			// The bytes parsed; only the values are beyond this codec.
+			col.err = err
 		default:
-			if err := r.Skip(kind); err != nil {
+			return nil, fmt.Errorf("codec: %s column: %w", t, err)
+		}
+		r.End() // each vector is one list-element object
+		if err := r.Err(); err != nil {
+			return nil, fmt.Errorf("codec: %s column: %w", t, err)
+		}
+		ch.cols = append(ch.cols, col)
+	}
+	r.End()
+	return ch, r.Err()
+}
+
+// decodeVector reads one serialized vector's fields (not its object
+// terminator — lists and nested children share this) and returns the row
+// values. A type this codec cannot produce values for still parses, so the
+// stream stays in sync; it reports ErrUnsupportedType as the column error.
+func decodeVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, error) {
+	if depth > maxTypeDepth {
+		return nil, fmt.Errorf("codec: vector nesting deeper than %d", maxTypeDepth)
+	}
+	vtype := uint64(vecFlat)
+	if r.TryField(90) {
+		vtype = r.Uvarint()
+	}
+	switch vtype {
+	case vecFlat:
+		return decodeFlatVector(r, t, count, depth)
+
+	case vecConstant:
+		vals, err := decodeVector(r, t, 1, depth+1)
+		if err != nil || len(vals) == 0 {
+			return nil, err
+		}
+		out := make([]any, count)
+		for i := range out {
+			out[i] = vals[0]
+		}
+		return out, nil
+
+	case vecDictionary:
+		if !r.TryField(91) {
+			return nil, fmt.Errorf("codec: dictionary vector missing selection")
+		}
+		sel := r.Bytes()
+		if len(sel) != count*4 {
+			return nil, fmt.Errorf("codec: dictionary selection is %d bytes for %d rows", len(sel), count)
+		}
+		if !r.TryField(92) {
+			return nil, fmt.Errorf("codec: dictionary vector missing dict count")
+		}
+		dictCount := r.Uvarint()
+		if dictCount > maxChunkRows {
+			return nil, fmt.Errorf("codec: implausible dictionary size %d", dictCount)
+		}
+		dict, err := decodeVector(r, t, int(dictCount), depth+1)
+		if err != nil || dict == nil {
+			return nil, err
+		}
+		out := make([]any, count)
+		for i := range out {
+			idx := binary.LittleEndian.Uint32(sel[i*4:])
+			if idx >= uint32(len(dict)) {
+				return nil, fmt.Errorf("codec: dictionary index %d out of range %d", idx, len(dict))
+			}
+			out[i] = dict[idx]
+		}
+		return out, nil
+
+	case vecSequence:
+		if !r.TryField(91) {
+			return nil, fmt.Errorf("codec: sequence vector missing start")
+		}
+		start := r.Svarint()
+		if !r.TryField(92) {
+			return nil, fmt.Errorf("codec: sequence vector missing increment")
+		}
+		inc := r.Svarint()
+		out := make([]any, count)
+		for i := range out {
+			v, err := sequenceValue(t.ID, start+int64(i)*inc)
+			if err != nil {
 				return nil, err
 			}
+			out[i] = v
 		}
+		return out, nil
+
+	default:
+		// FSST and anything newer cannot be parsed past without a schema.
+		return nil, fmt.Errorf("codec: unsupported vector encoding %d", vtype)
 	}
 }
 
-func decodeVector(r *qser.Reader, rows int) (Column, error) {
-	var (
-		col      Column
-		validity []byte
-		data     []byte
-		heap     []byte
-		hasType  bool
-	)
-	for {
-		id, kind, err := r.Field()
-		if err != nil {
-			return col, err
+func decodeFlatVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, error) {
+	unsupported := false
+	if r.TryField(99) {
+		r.Uvarint() // geometry storage format tag; the payload is WKB blobs
+		unsupported = true
+	}
+	if !r.TryField(100) {
+		return nil, fmt.Errorf("codec: vector missing validity flag")
+	}
+	hasNulls := r.Bool()
+	var validity []byte
+	if hasNulls {
+		if !r.TryField(101) {
+			return nil, fmt.Errorf("codec: vector claims nulls but has no validity mask")
 		}
-		if id == 0 {
-			break
+		validity = r.Bytes()
+		if len(validity) < (count+7)/8 {
+			return nil, fmt.Errorf("codec: validity mask short: %d bytes for %d rows", len(validity), count)
 		}
-		switch id {
-		case fvType:
-			col.Type, err = decodeType(r, 0)
+	}
+
+	switch t.ID {
+	case TypeVarchar, TypeBlob, TypeBit, TypeGeometry:
+		// Variable-width data is a list of length-prefixed strings; NULL
+		// slots ride as empty entries.
+		if t.ID != TypeVarchar && t.ID != TypeBlob {
+			unsupported = true
+		}
+		if !r.TryField(102) {
+			return nil, fmt.Errorf("codec: %s vector missing data", t)
+		}
+		n := r.ListCount()
+		if n != count {
+			return nil, fmt.Errorf("codec: %s vector has %d entries for %d rows", t, n, count)
+		}
+		vals := make([]any, count)
+		for i := range count {
+			b := r.Bytes()
+			if !valid(validity, i) || unsupported {
+				continue
+			}
+			if t.ID == TypeVarchar {
+				vals[i] = string(b)
+			} else {
+				vals[i] = append([]byte(nil), b...)
+			}
+		}
+		if unsupported {
+			return nil, unsupportedButParsed(r, t)
+		}
+		return vals, r.Err()
+
+	case TypeStruct:
+		if !r.TryField(103) {
+			return nil, fmt.Errorf("codec: struct vector missing children")
+		}
+		n := r.ListCount()
+		for i := range n {
+			var ft LogicalType
+			if i < len(t.Fields) {
+				ft = t.Fields[i].Type
+			}
+			if _, err := decodeVector(r, ft, count, depth+1); err != nil && !isUnsupported(err) {
+				return nil, err
+			}
+			r.End()
+		}
+		return nil, unsupportedButParsed(r, t)
+
+	case TypeList, TypeMap:
+		if !r.TryField(104) {
+			return nil, fmt.Errorf("codec: list vector missing size")
+		}
+		listSize := r.Uvarint()
+		if !r.TryField(105) {
+			return nil, fmt.Errorf("codec: list vector missing entries")
+		}
+		n := r.ListCount()
+		for range n {
+			if r.TryField(100) {
+				r.Uvarint() // offset
+			}
+			if r.TryField(101) {
+				r.Uvarint() // length
+			}
+			r.End()
+		}
+		if !r.TryField(106) {
+			return nil, fmt.Errorf("codec: list vector missing child")
+		}
+		var ct LogicalType
+		if t.Child != nil {
+			ct = *t.Child
+		}
+		if listSize > math.MaxInt32 {
+			return nil, fmt.Errorf("codec: implausible list size %d", listSize)
+		}
+		if _, err := decodeVector(r, ct, int(listSize), depth+1); err != nil && !isUnsupported(err) {
+			return nil, err
+		}
+		r.End()
+		return nil, unsupportedButParsed(r, t)
+
+	case TypeArray:
+		if !r.TryField(103) {
+			return nil, fmt.Errorf("codec: array vector missing size")
+		}
+		size := r.Uvarint()
+		if !r.TryField(104) {
+			return nil, fmt.Errorf("codec: array vector missing child")
+		}
+		var ct LogicalType
+		if t.Child != nil {
+			ct = *t.Child
+		}
+		if size > maxChunkRows {
+			return nil, fmt.Errorf("codec: implausible array size %d", size)
+		}
+		if _, err := decodeVector(r, ct, int(size)*count, depth+1); err != nil && !isUnsupported(err) {
+			return nil, err
+		}
+		r.End()
+		return nil, unsupportedButParsed(r, t)
+
+	default:
+		// Everything else is constant-size storage: one raw blob.
+		w := physicalWidth(t)
+		if w == 0 {
+			// No known width means no way to parse the blob's framing —
+			// but the blob is length-prefixed, so consume it and degrade.
+			if r.TryField(102) {
+				r.Bytes()
+			}
+			return nil, unsupportedButParsed(r, t)
+		}
+		if !r.TryField(102) {
+			return nil, fmt.Errorf("codec: %s vector missing data", t)
+		}
+		data := r.Bytes()
+		if len(data) < count*w {
+			return nil, fmt.Errorf("codec: %s vector data short: %d bytes for %d rows", t, len(data), count)
+		}
+		if unsupported || !supportedScalar(t) {
+			return nil, unsupportedButParsed(r, t)
+		}
+		vals := make([]any, count)
+		for i := range count {
+			if !valid(validity, i) {
+				continue
+			}
+			v, err := decodeCell(t, data[i*w:(i+1)*w])
 			if err != nil {
-				return col, err
+				return nil, err
 			}
-			hasType = true
-		case fvValidity:
-			if validity, err = r.Bytes(); err != nil {
-				return col, err
-			}
-		case fvData:
-			if data, err = r.Bytes(); err != nil {
-				return col, err
-			}
-		case fvHeap:
-			if heap, err = r.Bytes(); err != nil {
-				return col, err
-			}
-		default:
-			if err := r.Skip(kind); err != nil {
-				return col, err
-			}
+			vals[i] = v
 		}
+		return vals, r.Err()
 	}
-	if !hasType {
-		return col, fmt.Errorf("codec: vector missing type")
+}
+
+// unsupportedButParsed reports a column whose bytes were consumed correctly
+// but whose values this codec does not produce. The distinction matters:
+// the chunk stays decodable, only this column errors.
+func unsupportedButParsed(r *qser.Reader, t LogicalType) error {
+	if err := r.Err(); err != nil {
+		return err
 	}
-	if validity != nil && len(validity) < (rows+7)/8 {
-		return col, fmt.Errorf("codec: validity mask short: %d bytes for %d rows", len(validity), rows)
-	}
-	col.vals, col.err = decodeValues(col.Type, rows, validity, data, heap)
-	// A malformed vector is a decode error for the whole chunk; an
-	// unsupported type is only an error for this column.
-	if col.err != nil {
-		if _, ok := col.err.(ErrUnsupportedType); !ok {
-			return col, col.err
-		}
-	}
-	return col, nil
+	return ErrUnsupportedType{Type: t}
+}
+
+func isUnsupported(err error) bool {
+	_, ok := err.(ErrUnsupportedType)
+	return ok
 }
 
 func valid(validity []byte, row int) bool {
 	return validity == nil || validity[row/8]&(1<<(row%8)) != 0
 }
 
-func fixedWidth(id TypeID, width uint8) int {
-	switch id {
+// physicalWidth is the storage size of a constant-size type; 0 for types
+// stored variably or unknown to this codec.
+func physicalWidth(t LogicalType) int {
+	switch t.ID {
 	case TypeBoolean, TypeTinyint, TypeUTinyint:
 		return 1
 	case TypeSmallint, TypeUSmallint:
 		return 2
 	case TypeInteger, TypeUInteger, TypeFloat, TypeDate:
 		return 4
-	case TypeBigint, TypeUBigint, TypeDouble, TypeTime,
-		TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS:
+	case TypeBigint, TypeUBigint, TypeDouble, TypeTime, TypeTimeTZ, TypeTimeNS,
+		TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS, TypeTimestampTZ:
 		return 8
+	case TypeInterval, TypeHugeint, TypeUHugeint, TypeUUID:
+		return 16
 	case TypeDecimal:
 		switch {
-		case width <= 4:
+		case t.Width <= 4:
 			return 2
-		case width <= 9:
+		case t.Width <= 9:
 			return 4
-		case width <= 18:
+		case t.Width <= 18:
 			return 8
 		default:
 			return 16
 		}
-	case TypeVarchar, TypeBlob:
-		return 16 // string_t entries; payload may continue in the heap
+	case TypeEnum:
+		return enumIndexWidth(len(t.Enum))
 	}
 	return 0
 }
 
-func decodeValues(t LogicalType, rows int, validity, data, heap []byte) ([]any, error) {
-	w := fixedWidth(t.ID, t.Width)
-	if w == 0 {
-		return nil, ErrUnsupportedType{Type: t}
+// supportedScalar reports whether decodeCell produces values for this type.
+// Types outside this set still parse; they just error per column.
+func supportedScalar(t LogicalType) bool {
+	switch t.ID {
+	case TypeBoolean, TypeTinyint, TypeUTinyint, TypeSmallint, TypeUSmallint,
+		TypeInteger, TypeUInteger, TypeBigint, TypeUBigint,
+		TypeFloat, TypeDouble, TypeDecimal, TypeDate, TypeTime,
+		TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS, TypeTimestampTZ,
+		TypeEnum:
+		return true
 	}
-	if len(data) < rows*w {
-		return nil, fmt.Errorf("codec: %s vector data short: %d bytes for %d rows", t, len(data), rows)
-	}
-	vals := make([]any, rows)
-	for i := range rows {
-		if !valid(validity, i) {
-			continue
-		}
-		cell := data[i*w : (i+1)*w]
-		v, err := decodeCell(t, cell, heap)
-		if err != nil {
-			return nil, err
-		}
-		vals[i] = v
-	}
-	return vals, nil
+	return false
 }
 
-func decodeCell(t LogicalType, cell, heap []byte) (any, error) {
+func decodeCell(t LogicalType, cell []byte) (any, error) {
 	switch t.ID {
 	case TypeBoolean:
 		return cell[0] != 0, nil
@@ -304,24 +464,24 @@ func decodeCell(t LogicalType, cell, heap []byte) (any, error) {
 		return dateValue(int32(binary.LittleEndian.Uint32(cell))), nil
 	case TypeTime:
 		return Time(binary.LittleEndian.Uint64(cell)), nil
-	case TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS:
+	case TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS, TypeTimestampTZ:
 		return timestampValue(t.ID, int64(binary.LittleEndian.Uint64(cell))), nil
 	case TypeDecimal:
 		return decodeDecimalCell(t, cell), nil
-	case TypeVarchar:
-		b, err := stringCell(cell, heap)
-		if err != nil {
-			return nil, err
+	case TypeEnum:
+		var idx int
+		switch len(cell) {
+		case 1:
+			idx = int(cell[0])
+		case 2:
+			idx = int(binary.LittleEndian.Uint16(cell))
+		default:
+			idx = int(binary.LittleEndian.Uint32(cell))
 		}
-		return string(b), nil
-	case TypeBlob:
-		b, err := stringCell(cell, heap)
-		if err != nil {
-			return nil, err
+		if idx >= len(t.Enum) {
+			return nil, fmt.Errorf("codec: enum index %d outside dictionary of %d", idx, len(t.Enum))
 		}
-		out := make([]byte, len(b))
-		copy(out, b)
-		return out, nil
+		return t.Enum[idx], nil
 	}
 	return nil, ErrUnsupportedType{Type: t}
 }
@@ -344,22 +504,26 @@ func decodeDecimalCell(t LogicalType, cell []byte) Decimal {
 	}
 }
 
-// stringCell reads one 16-byte string_t entry: uint32 length, then either
-// the content inlined (length <= 12) or a 4-byte prefix and a uint64 offset
-// into the heap. The prefix is duplicated from the content; a mismatch means
-// the payload is corrupt.
-func stringCell(cell, heap []byte) ([]byte, error) {
-	n := binary.LittleEndian.Uint32(cell[:4])
-	if n <= 12 {
-		return cell[4 : 4+n], nil
+// sequenceValue materializes one element of a SEQUENCE vector, which only
+// integer types produce.
+func sequenceValue(id TypeID, v int64) (any, error) {
+	switch id {
+	case TypeTinyint:
+		return int8(v), nil
+	case TypeSmallint:
+		return int16(v), nil
+	case TypeInteger:
+		return int32(v), nil
+	case TypeBigint:
+		return v, nil
+	case TypeUTinyint:
+		return uint8(v), nil
+	case TypeUSmallint:
+		return uint16(v), nil
+	case TypeUInteger:
+		return uint32(v), nil
+	case TypeUBigint:
+		return uint64(v), nil
 	}
-	off := binary.LittleEndian.Uint64(cell[8:16])
-	if off > uint64(len(heap)) || uint64(n) > uint64(len(heap))-off {
-		return nil, fmt.Errorf("codec: string heap reference out of range (off=%d len=%d heap=%d)", off, n, len(heap))
-	}
-	b := heap[off : off+uint64(n)]
-	if string(cell[4:8]) != string(b[:4]) {
-		return nil, fmt.Errorf("codec: string prefix mismatch, corrupt heap")
-	}
-	return b, nil
+	return nil, fmt.Errorf("codec: sequence vector of non-integer type %d", id)
 }

@@ -1,8 +1,8 @@
-// Package codec decodes DuckDB's binary result serialization: schemas,
-// logical type trees, and data chunks with validity, as carried by the Quack
-// protocol. It has no knowledge of HTTP or the transport; bytes in, typed
-// values out. Anything that speaks the framing can use it — a proxy, a CLI,
-// another client's test oracle.
+// Package codec decodes DuckDB's binary result serialization: logical type
+// trees and data chunks with validity, as carried inside Quack's
+// PREPARE_RESPONSE and FETCH_RESPONSE messages. It has no knowledge of HTTP
+// or the transport; bytes in, typed values out. Anything that has the bytes
+// can use it — a proxy, a CLI, another client's test oracle.
 package codec
 
 import (
@@ -11,23 +11,20 @@ import (
 	"slices"
 )
 
-// Codec decodes payloads for one negotiated protocol/serialization version
-// pair. Codecs are stateless and safe for concurrent use.
+// Codec decodes payloads for one negotiated quack protocol version. Codecs
+// are stateless and safe for concurrent use.
 type Codec struct {
-	protocol      int
-	serialization int
+	version uint64
 }
 
-// For returns the codec for a negotiated version pair, or an error listing
+// For returns the codec for a negotiated quack version, or an error listing
 // what this build supports.
-func For(protocol, serialization int) (*Codec, error) {
-	if c, ok := registry[versionKey{protocol, serialization}]; ok {
+func For(version uint64) (*Codec, error) {
+	if c, ok := registry[version]; ok {
 		return c, nil
 	}
-	return nil, fmt.Errorf("codec: no decoder for protocol %d / serialization %d (supported: %v)",
-		protocol, serialization, slices.Collect(maps.Keys(registry)))
+	return nil, fmt.Errorf("codec: no decoder for quack version %d (supported: %v)",
+		version, slices.Sorted(maps.Keys(registry)))
 }
 
-func (c *Codec) Versions() (protocol, serialization int) {
-	return c.protocol, c.serialization
-}
+func (c *Codec) Version() uint64 { return c.version }

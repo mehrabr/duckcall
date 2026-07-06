@@ -66,9 +66,6 @@ func TestQuickstart(t *testing.T) {
 	if len(got) != 2 || got[0] != "anvil" {
 		t.Fatalf("rows: %v", got)
 	}
-	if s.OpenQueries() != 0 {
-		t.Fatal("result leaked on server after rows.Close")
-	}
 }
 
 func TestNullsAndTypes(t *testing.T) {
@@ -155,7 +152,7 @@ func TestExecRejected(t *testing.T) {
 
 func TestQueryCancellation(t *testing.T) {
 	s := startServer(t)
-	s.ChunkDelay = 20 * time.Millisecond
+	s.FetchDelay = 20 * time.Millisecond
 	vals := make([]any, 500)
 	for i := range vals {
 		vals[i] = int32(i)

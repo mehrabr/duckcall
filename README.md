@@ -54,8 +54,9 @@ new registered codec version rather than a fork of the tree.
 
 Tier 1 ships now: BOOLEAN, the integer family (signed and unsigned),
 FLOAT/DOUBLE, DECIMAL at every physical width including INT128, VARCHAR and
-BLOB in both the inlined and heap forms of the 16-byte string layout, DATE,
-TIME, and all four TIMESTAMP precisions, with NULL/validity everywhere.
+BLOB, ENUM, DATE, TIME, all four TIMESTAMP precisions plus TIMESTAMPTZ,
+with NULL/validity everywhere, across flat, constant, dictionary, and
+sequence vector encodings.
 
 Nested and exotic types (LIST, STRUCT, MAP, HUGEINT, UUID, ...) come later.
 A column duckcall cannot decode reports `codec.ErrUnsupportedType` for that
@@ -77,10 +78,13 @@ register per negotiated version, so 1.5.x and 2.0 decoders will coexist in
 one binary during the transition. Expect breaking releases while upstream
 breaks; each one gets a changelog entry naming the upstream commit.
 
-Current fixtures are synthetic, built by `codec/codectest` and fuzzed from
-day one. A captured golden corpus from a live `quack_serve`, plus a
-differential conformance harness against the official client, is the next
-milestone.
+Fixtures come from two sources: synthetic ones built by `codec/codectest`
+and fuzzed from day one, and a captured corpus from a live `quack_serve`
+(DuckDB v1.5.4) in `testdata/corpus`, which the envelope tests decode and
+re-encode byte for byte. The corpus regenerates by putting any logging
+proxy between `quack_serve` and the official client and driving
+`quack_query` through it. A differential conformance harness against the
+official client is the next milestone.
 
 ## quackbouncer
 
