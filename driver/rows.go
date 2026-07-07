@@ -3,10 +3,12 @@ package driver
 import (
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"io"
 	"iter"
 	"math"
+	"math/big"
 	"strconv"
 	"time"
 
@@ -59,7 +61,7 @@ func (r *rows) Next(dest []driver.Value) error {
 		if err != nil {
 			return err
 		}
-		dest[i], err = toDriverValue(v)
+		dest[i], err = toDriverValue(r.chunk.Column(i).Type, v)
 		if err != nil {
 			return err
 		}
@@ -80,8 +82,19 @@ func (r *rows) Close() error {
 }
 
 // toDriverValue narrows codec's Go types to the driver.Value set. Lossless
-// or bust: anything that cannot cross exactly goes as a string.
-func toDriverValue(v any) (driver.Value, error) {
+// or bust: anything that cannot cross exactly goes as a string. Nested
+// values (LIST, STRUCT, MAP, ARRAY) cross as JSON — the one string form a
+// database/sql caller can feed to a parser instead of regexing apart; the
+// type tree rides along so element rendering stays type-exact.
+func toDriverValue(t codec.LogicalType, v any) (driver.Value, error) {
+	switch t.ID {
+	case codec.TypeList, codec.TypeArray, codec.TypeStruct, codec.TypeMap:
+		if v == nil {
+			return nil, nil
+		}
+		b, err := appendJSON(nil, t, v)
+		return string(b), err
+	}
 	switch x := v.(type) {
 	case nil, bool, int64, float64, string, []byte:
 		return x, nil
@@ -104,13 +117,187 @@ func toDriverValue(v any) (driver.Value, error) {
 		return int64(x), nil
 	case float32:
 		return float64(x), nil
+	case *big.Int:
+		if x.IsInt64() {
+			return x.Int64(), nil
+		}
+		return x.String(), nil
 	case codec.Decimal:
 		return x.String(), nil
 	case codec.Time:
+		return x.String(), nil
+	case codec.TimeNS:
+		return x.String(), nil
+	case codec.TimeTZ:
+		return x.String(), nil
+	case codec.Interval:
+		return x.String(), nil
+	case codec.UUID:
 		return x.String(), nil
 	case time.Time:
 		return x, nil
 	default:
 		return nil, fmt.Errorf("duckcall: no driver.Value mapping for %T", v)
+	}
+}
+
+// appendJSON renders a decoded nested value as JSON, walking the type tree
+// in step with the value. Struct fields keep declaration order (and survive
+// duplicate names, which encoding/json maps would not); map keys stringify
+// through their scalar rendering, the same convention duckdb's to_json
+// uses.
+func appendJSON(b []byte, t codec.LogicalType, v any) ([]byte, error) {
+	if v == nil {
+		return append(b, "null"...), nil
+	}
+	switch t.ID {
+	case codec.TypeList, codec.TypeArray:
+		vals, ok := v.([]any)
+		if !ok {
+			return nil, fmt.Errorf("duckcall: %s value is %T", t, v)
+		}
+		b = append(b, '[')
+		var err error
+		for i, e := range vals {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			if b, err = appendJSON(b, *t.Child, e); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, ']'), nil
+
+	case codec.TypeStruct:
+		s, ok := v.(codec.Struct)
+		if !ok || len(s) != len(t.Fields) {
+			return nil, fmt.Errorf("duckcall: %s value is %T", t, v)
+		}
+		b = append(b, '{')
+		var err error
+		for i, e := range s {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			if b, err = appendJSONString(b, e.Name); err != nil {
+				return nil, err
+			}
+			b = append(b, ':')
+			if b, err = appendJSON(b, t.Fields[i].Type, e.Value); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, '}'), nil
+
+	case codec.TypeMap:
+		entries, ok := v.([]codec.MapEntry)
+		if !ok || t.Child == nil || len(t.Child.Fields) != 2 {
+			return nil, fmt.Errorf("duckcall: %s value is %T", t, v)
+		}
+		b = append(b, '{')
+		for i, e := range entries {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			key, err := toDriverValue(t.Child.Fields[0].Type, e.Key)
+			if err != nil {
+				return nil, err
+			}
+			if b, err = appendJSONString(b, keyString(key)); err != nil {
+				return nil, err
+			}
+			b = append(b, ':')
+			if b, err = appendJSON(b, t.Child.Fields[1].Type, e.Value); err != nil {
+				return nil, err
+			}
+		}
+		return append(b, '}'), nil
+	}
+
+	// Scalar leaf. Numbers stay numbers — including HUGEINT and DECIMAL,
+	// whose digit strings are valid JSON numbers — and everything temporal
+	// or exotic goes through its duckdb-style rendering as a JSON string.
+	dv, err := toDriverValue(t, v)
+	if err != nil {
+		return nil, err
+	}
+	switch x := dv.(type) {
+	case bool:
+		return strconv.AppendBool(b, x), nil
+	case int64:
+		return strconv.AppendInt(b, x, 10), nil
+	case float64:
+		return appendJSONFloat(b, x)
+	case string:
+		if jsonNumberSafe(t.ID) {
+			return append(b, x...), nil
+		}
+		return appendJSONString(b, x)
+	case []byte:
+		return appendJSONString(b, string(x))
+	case time.Time:
+		return appendJSONString(b, timeString(t.ID, x))
+	default:
+		return nil, fmt.Errorf("duckcall: no JSON rendering for %T", dv)
+	}
+}
+
+// jsonNumberSafe reports types whose string rendering is already a JSON
+// number literal.
+func jsonNumberSafe(id codec.TypeID) bool {
+	switch id {
+	case codec.TypeDecimal, codec.TypeHugeint, codec.TypeUHugeint, codec.TypeUBigint:
+		return true
+	}
+	return false
+}
+
+func appendJSONFloat(b []byte, f float64) ([]byte, error) {
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		// JSON has no literals for these; duckdb's to_json emits strings.
+		return appendJSONString(b, strconv.FormatFloat(f, 'g', -1, 64))
+	}
+	return strconv.AppendFloat(b, f, 'g', -1, 64), nil
+}
+
+func appendJSONString(b []byte, s string) ([]byte, error) {
+	j, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, j...), nil
+}
+
+// keyString flattens an already-converted map key to text.
+func keyString(v driver.Value) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(x)
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprint(x)
+	}
+}
+
+// timeString renders DATE and the TIMESTAMP family the way duckdb casts
+// them to VARCHAR; Go's .999 verbs drop trailing fraction zeros the same
+// way duckdb does.
+func timeString(id codec.TypeID, ts time.Time) string {
+	switch id {
+	case codec.TypeDate:
+		return ts.Format("2006-01-02")
+	case codec.TypeTimestampTZ:
+		return ts.Format("2006-01-02 15:04:05.999999999") + "+00"
+	default:
+		return ts.Format("2006-01-02 15:04:05.999999999")
 	}
 }

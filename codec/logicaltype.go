@@ -50,6 +50,7 @@ const (
 	TypeEnum         TypeID = 104
 	TypeUnion        TypeID = 107
 	TypeArray        TypeID = 108
+	TypeVariant      TypeID = 109
 )
 
 // LogicalType is a decoded type tree. Nested kinds (list/struct/map/array)
@@ -122,7 +123,8 @@ var typeNames = map[TypeID]string{
 	TypeDate: "DATE", TypeTime: "TIME", TypeTimeTZ: "TIMETZ", TypeTimeNS: "TIME_NS",
 	TypeTimestampSec: "TIMESTAMP_S", TypeTimestampMS: "TIMESTAMP_MS",
 	TypeTimestamp: "TIMESTAMP", TypeTimestampNS: "TIMESTAMP_NS", TypeTimestampTZ: "TIMESTAMPTZ",
-	TypeInterval: "INTERVAL", TypeUUID: "UUID", TypeGeometry: "GEOMETRY", TypeUnion: "UNION",
+	TypeInterval: "INTERVAL", TypeUUID: "UUID", TypeGeometry: "GEOMETRY",
+	TypeUnion: "UNION", TypeVariant: "VARIANT",
 }
 
 // ExtraTypeInfoType mirrors duckdb's enum; the wire tags each type-info

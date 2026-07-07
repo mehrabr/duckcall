@@ -73,6 +73,14 @@ const (
 // beyond it is a corrupt or hostile length.
 const maxChunkRows = 1 << 16
 
+// maxVectorRows bounds any single vector's row count, including nested
+// children, where list_size legitimately exceeds the chunk's row count. The
+// cap matters because a child can serialize as a constant vector — a few
+// bytes of input demanding list_size materialized values — so input length
+// alone does not bound allocation. 16M child rows is orders of magnitude
+// past any real batch payload.
+const maxVectorRows = 1 << 24
+
 // decodeChunkContents reads one DataChunk object's fields: 100 row count,
 // 101 the column types, 102 the vectors. Chunks are self-describing — the
 // types ride in every chunk — so decoding needs no schema.
@@ -137,6 +145,9 @@ func decodeChunkContents(r *qser.Reader) (*Chunk, error) {
 func decodeVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, error) {
 	if depth > maxTypeDepth {
 		return nil, fmt.Errorf("codec: vector nesting deeper than %d", maxTypeDepth)
+	}
+	if count > maxVectorRows {
+		return nil, fmt.Errorf("codec: implausible vector row count %d", count)
 	}
 	vtype := uint64(vecFlat)
 	if r.TryField(90) {
@@ -236,7 +247,9 @@ func decodeFlatVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, e
 	case TypeVarchar, TypeBlob, TypeBit, TypeGeometry:
 		// Variable-width data is a list of length-prefixed strings; NULL
 		// slots ride as empty entries.
-		if t.ID != TypeVarchar && t.ID != TypeBlob {
+		if t.ID == TypeGeometry {
+			// WKB blobs parse fine; producing geometry values is out of
+			// scope for this codec.
 			unsupported = true
 		}
 		if !r.TryField(102) {
@@ -252,9 +265,16 @@ func decodeFlatVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, e
 			if !valid(validity, i) || unsupported {
 				continue
 			}
-			if t.ID == TypeVarchar {
+			switch t.ID {
+			case TypeVarchar:
 				vals[i] = string(b)
-			} else {
+			case TypeBit:
+				s, err := bitString(b)
+				if err != nil {
+					return nil, err
+				}
+				vals[i] = s
+			default:
 				vals[i] = append([]byte(nil), b...)
 			}
 		}
@@ -263,77 +283,160 @@ func decodeFlatVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, e
 		}
 		return vals, r.Err()
 
-	case TypeStruct:
+	case TypeStruct, TypeUnion, TypeVariant:
+		// All three store as one child vector per field, each with its own
+		// validity. UNION (tag child first) and VARIANT (fixed internal
+		// shape) share the storage; their fields ride in the type info, so
+		// they parse structurally, but only plain STRUCT produces values.
 		if !r.TryField(103) {
-			return nil, fmt.Errorf("codec: struct vector missing children")
+			return nil, fmt.Errorf("codec: %s vector missing children", t)
 		}
 		n := r.ListCount()
+		if n != len(t.Fields) {
+			return nil, fmt.Errorf("codec: %s vector has %d children for %d fields", t, n, len(t.Fields))
+		}
+		children := make([][]any, n)
 		for i := range n {
-			var ft LogicalType
-			if i < len(t.Fields) {
-				ft = t.Fields[i].Type
-			}
-			if _, err := decodeVector(r, ft, count, depth+1); err != nil && !isUnsupported(err) {
+			vals, err := decodeVector(r, t.Fields[i].Type, count, depth+1)
+			switch {
+			case err == nil:
+				children[i] = vals
+			case isUnsupported(err):
+				unsupported = true
+			default:
 				return nil, err
 			}
 			r.End()
 		}
-		return nil, unsupportedButParsed(r, t)
+		if unsupported || t.ID != TypeStruct {
+			return nil, unsupportedButParsed(r, t)
+		}
+		vals := make([]any, count)
+		for row := range count {
+			if !valid(validity, row) {
+				continue
+			}
+			s := make(Struct, n)
+			for i := range n {
+				s[i] = StructEntry{Name: t.Fields[i].Name, Value: children[i][row]}
+			}
+			vals[row] = s
+		}
+		return vals, r.Err()
 
 	case TypeList, TypeMap:
 		if !r.TryField(104) {
 			return nil, fmt.Errorf("codec: list vector missing size")
 		}
 		listSize := r.Uvarint()
+		if listSize > maxVectorRows {
+			return nil, fmt.Errorf("codec: implausible list size %d", listSize)
+		}
 		if !r.TryField(105) {
 			return nil, fmt.Errorf("codec: list vector missing entries")
 		}
 		n := r.ListCount()
-		for range n {
+		if n != count {
+			return nil, fmt.Errorf("codec: %s vector has %d entries for %d rows", t, n, count)
+		}
+		offs := make([]uint64, n)
+		lens := make([]uint64, n)
+		for i := range n {
 			if r.TryField(100) {
-				r.Uvarint() // offset
+				offs[i] = r.Uvarint()
 			}
 			if r.TryField(101) {
-				r.Uvarint() // length
+				lens[i] = r.Uvarint()
 			}
 			r.End()
 		}
 		if !r.TryField(106) {
 			return nil, fmt.Errorf("codec: list vector missing child")
 		}
-		var ct LogicalType
-		if t.Child != nil {
-			ct = *t.Child
+		if t.Child == nil {
+			return nil, fmt.Errorf("codec: %s vector without child type", t)
 		}
-		if listSize > math.MaxInt32 {
-			return nil, fmt.Errorf("codec: implausible list size %d", listSize)
-		}
-		if _, err := decodeVector(r, ct, int(listSize), depth+1); err != nil && !isUnsupported(err) {
-			return nil, err
+		childVals, childErr := decodeVector(r, *t.Child, int(listSize), depth+1)
+		if childErr != nil && !isUnsupported(childErr) {
+			return nil, childErr
 		}
 		r.End()
-		return nil, unsupportedButParsed(r, t)
+		if unsupported {
+			return nil, unsupportedButParsed(r, t)
+		}
+		if childErr != nil {
+			// Report the child's error so the message names the type the
+			// codec actually cannot decode.
+			if err := r.Err(); err != nil {
+				return nil, err
+			}
+			return nil, childErr
+		}
+		vals := make([]any, count)
+		for i := range count {
+			if !valid(validity, i) {
+				continue
+			}
+			off, ln := offs[i], lens[i]
+			if ln > listSize || off > listSize-ln {
+				return nil, fmt.Errorf("codec: list entry [%d,%d) outside child of %d", off, off+ln, listSize)
+			}
+			if t.ID == TypeMap {
+				entries := make([]MapEntry, ln)
+				for j := range entries {
+					// The child of a MAP is STRUCT(key, value); rows are
+					// never NULL on a real wire, so a nil stays a zero entry.
+					if s, ok := childVals[off+uint64(j)].(Struct); ok && len(s) == 2 {
+						entries[j] = MapEntry{Key: s[0].Value, Value: s[1].Value}
+					}
+				}
+				vals[i] = entries
+				continue
+			}
+			row := make([]any, ln)
+			copy(row, childVals[off:off+ln])
+			vals[i] = row
+		}
+		return vals, r.Err()
 
 	case TypeArray:
 		if !r.TryField(103) {
 			return nil, fmt.Errorf("codec: array vector missing size")
 		}
 		size := r.Uvarint()
+		if size > maxVectorRows || int(size)*count > maxVectorRows {
+			return nil, fmt.Errorf("codec: implausible array size %d", size)
+		}
 		if !r.TryField(104) {
 			return nil, fmt.Errorf("codec: array vector missing child")
 		}
-		var ct LogicalType
-		if t.Child != nil {
-			ct = *t.Child
+		if t.Child == nil {
+			return nil, fmt.Errorf("codec: %s vector without child type", t)
 		}
-		if size > maxChunkRows {
-			return nil, fmt.Errorf("codec: implausible array size %d", size)
-		}
-		if _, err := decodeVector(r, ct, int(size)*count, depth+1); err != nil && !isUnsupported(err) {
-			return nil, err
+		childVals, childErr := decodeVector(r, *t.Child, int(size)*count, depth+1)
+		if childErr != nil && !isUnsupported(childErr) {
+			return nil, childErr
 		}
 		r.End()
-		return nil, unsupportedButParsed(r, t)
+		if unsupported {
+			return nil, unsupportedButParsed(r, t)
+		}
+		if childErr != nil {
+			if err := r.Err(); err != nil {
+				return nil, err
+			}
+			return nil, childErr
+		}
+		vals := make([]any, count)
+		for i := range count {
+			if !valid(validity, i) {
+				continue
+			}
+			row := make([]any, size)
+			copy(row, childVals[i*int(size):])
+			vals[i] = row
+		}
+		return vals, r.Err()
 
 	default:
 		// Everything else is constant-size storage: one raw blob.
@@ -369,6 +472,37 @@ func decodeFlatVector(r *qser.Reader, t LogicalType, count, depth int) ([]any, e
 		}
 		return vals, r.Err()
 	}
+}
+
+// timeTZMaxOffset is dtime_tz_t's MAX_OFFSET: ±15:59:59 in seconds. Offsets
+// are stored as MAX_OFFSET - offset so bigger offsets sort earlier.
+const timeTZMaxOffset = 16*60*60 - 1
+
+// bitString renders duckdb's BIT storage: one leading byte holding the
+// count of padding bits at the front of the first data byte, then the bits
+// MSB-first.
+func bitString(b []byte) (string, error) {
+	if len(b) == 0 {
+		return "", fmt.Errorf("codec: BIT value with no padding byte")
+	}
+	padding := int(b[0])
+	if padding > 7 || (len(b) == 1 && padding != 0) {
+		return "", fmt.Errorf("codec: BIT value claims %d padding bits over %d bytes", padding, len(b)-1)
+	}
+	if len(b) == 1 {
+		return "", nil
+	}
+	out := make([]byte, 0, (len(b)-1)*8-padding)
+	for i, by := range b[1:] {
+		start := 0
+		if i == 0 {
+			start = padding
+		}
+		for bit := start; bit < 8; bit++ {
+			out = append(out, '0'+(by>>(7-bit))&1)
+		}
+	}
+	return string(out), nil
 }
 
 // unsupportedButParsed reports a column whose bytes were consumed correctly
@@ -430,7 +564,7 @@ func supportedScalar(t LogicalType) bool {
 		TypeInteger, TypeUInteger, TypeBigint, TypeUBigint,
 		TypeFloat, TypeDouble, TypeDecimal, TypeDate, TypeTime,
 		TypeTimestampSec, TypeTimestampMS, TypeTimestamp, TypeTimestampNS, TypeTimestampTZ,
-		TypeEnum:
+		TypeEnum, TypeHugeint, TypeUHugeint, TypeUUID, TypeInterval, TypeTimeTZ, TypeTimeNS:
 		return true
 	}
 	return false
@@ -468,6 +602,34 @@ func decodeCell(t LogicalType, cell []byte) (any, error) {
 		return timestampValue(t.ID, int64(binary.LittleEndian.Uint64(cell))), nil
 	case TypeDecimal:
 		return decodeDecimalCell(t, cell), nil
+	case TypeHugeint:
+		// hugeint_t stores lower first, upper second, little-endian halves.
+		return int128Big(int64(binary.LittleEndian.Uint64(cell[8:])), binary.LittleEndian.Uint64(cell[:8])), nil
+	case TypeUHugeint:
+		return uint128Big(binary.LittleEndian.Uint64(cell[8:]), binary.LittleEndian.Uint64(cell[:8])), nil
+	case TypeUUID:
+		// Stored as a hugeint with the sign bit flipped so numeric order
+		// matches UUID order; flip back and lay the halves out big-endian.
+		var u UUID
+		binary.BigEndian.PutUint64(u[:8], binary.LittleEndian.Uint64(cell[8:])^(1<<63))
+		binary.BigEndian.PutUint64(u[8:], binary.LittleEndian.Uint64(cell[:8]))
+		return u, nil
+	case TypeInterval:
+		return Interval{
+			Months: int32(binary.LittleEndian.Uint32(cell)),
+			Days:   int32(binary.LittleEndian.Uint32(cell[4:])),
+			Micros: int64(binary.LittleEndian.Uint64(cell[8:])),
+		}, nil
+	case TypeTimeTZ:
+		// dtime_tz_t packs micros into the top 40 bits and the UTC offset,
+		// biased and reverse-ordered, into the low 24.
+		bits := binary.LittleEndian.Uint64(cell)
+		return TimeTZ{
+			Micros: int64(bits >> 24),
+			Offset: timeTZMaxOffset - int32(bits&0xFFFFFF),
+		}, nil
+	case TypeTimeNS:
+		return TimeNS(binary.LittleEndian.Uint64(cell)), nil
 	case TypeEnum:
 		var idx int
 		switch len(cell) {

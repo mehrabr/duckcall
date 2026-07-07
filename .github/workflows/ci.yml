@@ -23,11 +23,26 @@ jobs:
       - name: fuzz (smoke)
         run: |
           go test -fuzz=FuzzDecodeChunk -fuzztime=20s ./codec
-          go test -fuzz=FuzzDecodeSchema -fuzztime=10s ./codec
+          go test -fuzz=FuzzDecodePrepare -fuzztime=10s ./codec
+          go test -fuzz=FuzzDecodeFetch -fuzztime=10s ./codec
       - name: deslop
         if: github.event_name == 'pull_request'
         run: scripts/deslop.sh --range "origin/${{ github.base_ref }}..HEAD"
 
-  # Placeholder for the conformance matrix: once quack_serve runs in CI,
-  # pinned DuckDB releases go here, plus a scheduled nightly against
-  # core_nightly that is allowed to fail loudly.
+  # Conformance: the live type matrix and the differential harness against
+  # a real quack_serve driven by the official client. Optional because it
+  # installs duckdb (and the quack extension) from the network at job time.
+  live-conformance:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: install duckdb
+        run: |
+          curl -fsSL https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
+      - name: live matrix + differential
+        run: QUACK_LIVE=1 go test -race -run 'TestLive' -v .

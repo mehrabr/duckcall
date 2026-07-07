@@ -234,4 +234,21 @@ func TestQueryError(t *testing.T) {
 	if !errors.As(err, &se) || se.Status != 0 || !strings.Contains(se.Message, "Parser Error") {
 		t.Fatalf("want parser error, got %v", err)
 	}
+	if errors.Is(err, wire.ErrConnectionExpired) {
+		t.Fatal("a parser error is not an expired connection")
+	}
+}
+
+func TestConnectionExpiredIsTyped(t *testing.T) {
+	s := startServer(t)
+	c := connect(t, s, nil)
+	s.ExpireConnections()
+	_, err := c.Prepare(context.Background(), "SELECT 1")
+	if !errors.Is(err, wire.ErrConnectionExpired) {
+		t.Fatalf("want ErrConnectionExpired via errors.Is, got %v", err)
+	}
+	// The DISCONNECT variant of the text must match too.
+	if err := c.Close(context.Background()); !errors.Is(err, wire.ErrConnectionExpired) {
+		t.Fatalf("disconnect on a dead session: want ErrConnectionExpired, got %v", err)
+	}
 }

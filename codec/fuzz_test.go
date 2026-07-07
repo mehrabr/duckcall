@@ -1,6 +1,8 @@
 package codec_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mehrabr/duckcall/codec"
@@ -14,6 +16,20 @@ import (
 
 func FuzzDecodeChunk(f *testing.F) {
 	f.Add(codectest.EncodeChunk(tier1Cols()))
+	f.Add(codectest.EncodeChunk(tier2Cols()))
+	// The malformed corpus doubles as seeds: each file is a near-valid
+	// payload one mutation away from interesting territory.
+	seeds, err := filepath.Glob(filepath.Join(malformedDir, "*.bin"))
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, path := range seeds {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(data)
+	}
 	f.Add([]byte{})
 	f.Add([]byte{0})
 	f.Add([]byte{0x64, 0x00, 0x01, 0xff, 0xff})
@@ -42,6 +58,7 @@ func FuzzDecodeChunk(f *testing.F) {
 func FuzzDecodePrepare(f *testing.F) {
 	cols := tier1Cols()
 	f.Add(codectest.EncodePrepareBody(cols, [][]codectest.Col{cols}, true, codec.Hugeint{Upper: 1, Lower: 2}))
+	f.Add(codectest.EncodePrepareBody(tier2Cols(), [][]codectest.Col{tier2Cols()}, false, codec.Hugeint{}))
 	f.Add(codectest.EncodePrepareBody(nil, nil, false, codec.Hugeint{}))
 	f.Add([]byte{})
 	c, err := codec.For(1)
@@ -69,6 +86,7 @@ func FuzzDecodePrepare(f *testing.F) {
 func FuzzDecodeFetch(f *testing.F) {
 	cols := tier1Cols()
 	f.Add(codectest.EncodeFetchBody([][]codectest.Col{cols}, 3))
+	f.Add(codectest.EncodeFetchBody([][]codectest.Col{tier2Cols()}, 4))
 	f.Add(codectest.EncodeFetchBody(nil, codec.BatchIndexAbsent))
 	f.Add([]byte{})
 	c, err := codec.For(1)

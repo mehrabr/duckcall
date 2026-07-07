@@ -115,6 +115,79 @@ func TestNullsAndTypes(t *testing.T) {
 	}
 }
 
+// TestTier2Values pins the driver-side story for the Tier 2 types: exotic
+// scalars cross as their duckdb-style strings (or int64 when lossless),
+// nested values cross as JSON.
+func TestTier2Values(t *testing.T) {
+	s := startServer(t)
+	intT := codectest.T(codec.TypeInteger)
+	strT := codectest.T(codec.TypeVarchar)
+	kvT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "key", Type: strT}, {Name: "value", Type: intT},
+	}}
+	ptT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "x", Type: intT}, {Name: "y", Type: strT},
+	}}
+	huge, _ := new(big.Int).SetString("170141183460469231731687303715884105727", 10)
+	s.AddResult("FROM tier2", []codectest.Col{
+		{Name: "h", Type: codectest.T(codec.TypeHugeint), Vals: []any{huge, nil}},
+		{Name: "hs", Type: codectest.T(codec.TypeHugeint), Vals: []any{big.NewInt(-5), nil}},
+		{Name: "u", Type: codectest.T(codec.TypeUUID), Vals: []any{
+			codec.UUID{0xc8, 0x18, 0x5c, 0xa9, 0x1c, 0x05, 0x40, 0xc3, 0x8a, 0x22, 0x0f, 0x63, 0x28, 0x86, 0x28, 0x8c}, nil}},
+		{Name: "iv", Type: codectest.T(codec.TypeInterval), Vals: []any{
+			codec.Interval{Months: 1, Days: 2, Micros: 3_000_000}, nil}},
+		{Name: "bits", Type: codectest.T(codec.TypeBit), Vals: []any{"10101", nil}},
+		{Name: "li", Type: codec.LogicalType{ID: codec.TypeList, Child: &intT}, Vals: []any{
+			[]any{int32(1), nil, int32(3)}, nil}},
+		{Name: "st", Type: ptT, Vals: []any{
+			codec.Struct{{Name: "x", Value: int32(7)}, {Name: "y", Value: "a\"b"}}, nil}},
+		{Name: "m", Type: codec.LogicalType{ID: codec.TypeMap, Child: &kvT}, Vals: []any{
+			[]codec.MapEntry{{Key: "a", Value: int32(1)}, {Key: "b", Value: nil}}, nil}},
+	}, 2048)
+	db := openDB(t, s)
+
+	rows, err := db.Query("FROM tier2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	rows.Next()
+	var h, u, iv, bits, li, st, m string
+	var hs int64
+	if err := rows.Scan(&h, &hs, &u, &iv, &bits, &li, &st, &m); err != nil {
+		t.Fatal(err)
+	}
+	for name, got := range map[string][2]string{
+		"h":    {h, "170141183460469231731687303715884105727"},
+		"u":    {u, "c8185ca9-1c05-40c3-8a22-0f632886288c"},
+		"iv":   {iv, "1 month 2 days 00:00:03"},
+		"bits": {bits, "10101"},
+		"li":   {li, "[1,null,3]"},
+		"st":   {st, `{"x":7,"y":"a\"b"}`},
+		"m":    {m, `{"a":1,"b":null}`},
+	} {
+		if got[0] != got[1] {
+			t.Errorf("%s: got %q, want %q", name, got[0], got[1])
+		}
+	}
+	if hs != -5 {
+		t.Errorf("hs: got %d, want -5", hs)
+	}
+
+	rows.Next()
+	nulls := make([]sql.NullString, 7)
+	var hn sql.NullInt64
+	if err := rows.Scan(&nulls[0], &hn, &nulls[1], &nulls[2], &nulls[3], &nulls[4], &nulls[5], &nulls[6]); err != nil {
+		t.Fatal(err)
+	}
+	for i, n := range nulls {
+		if n.Valid {
+			t.Errorf("column %d: want NULL, got %q", i, n.String)
+		}
+	}
+}
+
 func TestInterpolation(t *testing.T) {
 	s := startServer(t)
 	want := "SELECT * FROM t WHERE name = 'o''brien' AND n = 42 AND ok = TRUE -- ? stays"
@@ -179,6 +252,59 @@ func TestQueryCancellation(t *testing.T) {
 	}
 	if n >= 500 {
 		t.Fatal("stream ran to completion despite cancellation")
+	}
+}
+
+// TestExpiredSessionRetries: a pooled connection whose server-side session
+// died (restart, out-of-band disconnect) maps to driver.ErrBadConn at query
+// submission, so database/sql retires it and retries on a fresh connection
+// — invisible to the caller. Mid-result expiry stays an error; see
+// TestExpiredSessionMidResultFails.
+func TestExpiredSessionRetries(t *testing.T) {
+	s := startServer(t)
+	s.AddResult("SELECT 1", []codectest.Col{
+		{Name: "one", Type: codectest.T(codec.TypeInteger), Vals: []any{int32(1)}},
+	}, 2048)
+	db := openDB(t, s)
+	db.SetMaxOpenConns(1)
+
+	var one int
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+	s.ExpireConnections()
+	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("query after expiry: %v (one=%d)", err, one)
+	}
+	if s.OpenConnections() != 1 {
+		t.Fatalf("open connections: %d, want the one retried conn", s.OpenConnections())
+	}
+}
+
+func TestExpiredSessionMidResultFails(t *testing.T) {
+	s := startServer(t)
+	vals := make([]any, 100)
+	for i := range vals {
+		vals[i] = int32(i)
+	}
+	s.AddResult("FROM big", []codectest.Col{{Name: "i", Type: codectest.T(codec.TypeInteger), Vals: vals}}, 10)
+	db := openDB(t, s)
+
+	rows, err := db.Query("FROM big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("no first row")
+	}
+	s.ExpireConnections()
+	for rows.Next() {
+	}
+	// Losing the session mid-stream loses unfetched batches; that must be
+	// an error, never a silently short result.
+	if err := rows.Err(); err == nil {
+		t.Fatal("mid-result expiry did not surface through rows.Err")
 	}
 }
 

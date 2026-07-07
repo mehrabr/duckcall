@@ -66,7 +66,9 @@ func WriteType(w *qser.Writer, t codec.LogicalType) {
 		w.Field(200)
 		WriteType(w, *t.Child)
 		w.End()
-	case codec.TypeStruct:
+	case codec.TypeStruct, codec.TypeUnion, codec.TypeVariant:
+		// UNION and VARIANT reuse struct type info (tag member and internal
+		// shape included in Fields); only their vector values differ.
 		w.Field(101)
 		w.Bool(true)
 		w.FieldUvarint(100, infoStruct)
@@ -146,7 +148,7 @@ func writeVector(w *qser.Writer, t codec.LogicalType, vals []any) {
 		w.FieldBytes(101, validity)
 	}
 	switch t.ID {
-	case codec.TypeVarchar, codec.TypeBlob:
+	case codec.TypeVarchar, codec.TypeBlob, codec.TypeBit:
 		w.Field(102)
 		w.Uvarint(uint64(len(vals)))
 		for _, v := range vals {
@@ -154,13 +156,97 @@ func writeVector(w *qser.Writer, t codec.LogicalType, vals []any) {
 			case nil:
 				w.String("")
 			case string:
-				w.String(s)
+				if t.ID == codec.TypeBit {
+					w.BytesVal(bitBlob(s))
+				} else {
+					w.String(s)
+				}
 			case []byte:
 				w.BytesVal(s)
 			default:
 				panic(fmt.Sprintf("codectest: string column got %T", v))
 			}
 		}
+
+	case codec.TypeStruct:
+		// One child vector per field, all at the parent's row count. A NULL
+		// struct row writes NULL children, which is one of the shapes the
+		// wire allows.
+		w.Field(103)
+		w.Uvarint(uint64(len(t.Fields)))
+		for j, f := range t.Fields {
+			child := make([]any, len(vals))
+			for i, v := range vals {
+				if s, ok := v.(codec.Struct); ok {
+					if j >= len(s) {
+						panic(fmt.Sprintf("codectest: struct value has %d entries, type has %d fields", len(s), len(t.Fields)))
+					}
+					child[i] = s[j].Value
+				}
+			}
+			writeVector(w, f.Type, child)
+			w.End()
+		}
+
+	case codec.TypeList, codec.TypeMap:
+		// Rows flatten into one child vector; each row is an [offset,len)
+		// window. NULL rows write a {0,0} entry like duckdb does.
+		var child []any
+		type entry struct{ off, ln uint64 }
+		entries := make([]entry, len(vals))
+		for i, v := range vals {
+			var row []any
+			switch x := v.(type) {
+			case nil:
+			case []any:
+				row = x
+			case []codec.MapEntry:
+				row = make([]any, len(x))
+				for j, e := range x {
+					row[j] = codec.Struct{
+						{Name: t.Child.Fields[0].Name, Value: e.Key},
+						{Name: t.Child.Fields[1].Name, Value: e.Value},
+					}
+				}
+			default:
+				panic(fmt.Sprintf("codectest: %s column got %T", t, v))
+			}
+			entries[i] = entry{off: uint64(len(child)), ln: uint64(len(row))}
+			child = append(child, row...)
+		}
+		w.FieldUvarint(104, uint64(len(child)))
+		w.Field(105)
+		w.Uvarint(uint64(len(entries)))
+		for _, e := range entries {
+			w.FieldUvarint(100, e.off)
+			w.FieldUvarint(101, e.ln)
+			w.End()
+		}
+		w.Field(106)
+		writeVector(w, *t.Child, child)
+		w.End()
+
+	case codec.TypeArray:
+		size := int(t.ArraySize)
+		child := make([]any, 0, size*len(vals))
+		for _, v := range vals {
+			switch x := v.(type) {
+			case nil:
+				child = append(child, make([]any, size)...)
+			case []any:
+				if len(x) != size {
+					panic(fmt.Sprintf("codectest: array value has %d elements, type says %d", len(x), size))
+				}
+				child = append(child, x...)
+			default:
+				panic(fmt.Sprintf("codectest: %s column got %T", t, v))
+			}
+		}
+		w.FieldUvarint(103, uint64(size))
+		w.Field(104)
+		writeVector(w, *t.Child, child)
+		w.End()
+
 	default:
 		var data []byte
 		for _, v := range vals {
@@ -168,6 +254,30 @@ func writeVector(w *qser.Writer, t codec.LogicalType, vals []any) {
 		}
 		w.FieldBytes(102, data)
 	}
+}
+
+// bitBlob packs a "0101"-style string into duckdb's BIT storage: a leading
+// padding-bit count, then the bits MSB-first with padding bits set to 1 the
+// way upstream writes them.
+func bitBlob(s string) []byte {
+	padding := (8 - len(s)%8) % 8
+	if len(s) == 0 {
+		return []byte{0}
+	}
+	out := make([]byte, 1+(len(s)+padding)/8)
+	out[0] = byte(padding)
+	at := padding
+	for _, c := range []byte(s) {
+		if c != '0' && c != '1' {
+			panic(fmt.Sprintf("codectest: BIT column got non-bit character %q", c))
+		}
+		out[1+at/8] |= (c - '0') << (7 - at%8)
+		at++
+	}
+	for i := range padding {
+		out[1] |= 1 << (7 - i)
+	}
+	return out
 }
 
 func validityMask(vals []any) []byte {
@@ -248,6 +358,41 @@ func appendCell(data []byte, t codec.LogicalType, v any) []byte {
 		return le.AppendUint64(data, uint64(n))
 	case codec.TypeDecimal:
 		return appendDecimal(data, t, v)
+	case codec.TypeHugeint, codec.TypeUHugeint:
+		var hi int64
+		var lo uint64
+		if v != nil {
+			hi, lo = int128parts(v.(*big.Int))
+		}
+		data = le.AppendUint64(data, lo)
+		return le.AppendUint64(data, uint64(hi))
+	case codec.TypeUUID:
+		var hi, lo uint64
+		if v != nil {
+			u := v.(codec.UUID)
+			hi = binary.BigEndian.Uint64(u[:8]) ^ (1 << 63)
+			lo = binary.BigEndian.Uint64(u[8:])
+		}
+		data = le.AppendUint64(data, lo)
+		return le.AppendUint64(data, hi)
+	case codec.TypeInterval:
+		var iv codec.Interval
+		if v != nil {
+			iv = v.(codec.Interval)
+		}
+		data = le.AppendUint32(data, uint32(iv.Months))
+		data = le.AppendUint32(data, uint32(iv.Days))
+		return le.AppendUint64(data, uint64(iv.Micros))
+	case codec.TypeTimeTZ:
+		var bits uint64
+		if v != nil {
+			tz := v.(codec.TimeTZ)
+			const maxOffset = 16*60*60 - 1
+			bits = uint64(tz.Micros)<<24 | uint64(uint32(maxOffset-tz.Offset))&0xFFFFFF
+		}
+		return le.AppendUint64(data, bits)
+	case codec.TypeTimeNS:
+		return le.AppendUint64(data, uint64(nz[codec.TimeNS](v)))
 	case codec.TypeEnum:
 		var idx int
 		if v != nil {

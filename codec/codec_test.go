@@ -1,7 +1,9 @@
 package codec_test
 
 import (
+	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +67,97 @@ func tier1Cols() []codectest.Col {
 		{Name: "tstz", Type: codectest.T(codec.TypeTimestampTZ), Vals: []any{ts, nil, ts}},
 		{Name: "mood", Type: codec.LogicalType{ID: codec.TypeEnum, Enum: []string{"happy", "sad", "ok"}},
 			Vals: []any{"sad", nil, "happy"}},
+	}
+}
+
+// tier2Cols is one column per Tier 2 type — nested kinds and the exotic
+// scalars — with NULLs at every nesting level: whole rows, elements,
+// struct fields, and inner lists.
+func tier2Cols() []codectest.Col {
+	intT := codectest.T(codec.TypeInteger)
+	strT := codectest.T(codec.TypeVarchar)
+	listInt := codec.LogicalType{ID: codec.TypeList, Child: &intT}
+	pointT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "x", Type: intT}, {Name: "y", Type: strT},
+	}}
+	nestT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "id", Type: intT}, {Name: "pt", Type: pointT},
+	}}
+	kvT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "key", Type: strT}, {Name: "value", Type: intT},
+	}}
+	ikvT := codec.LogicalType{ID: codec.TypeStruct, Fields: []codec.StructField{
+		{Name: "key", Type: intT}, {Name: "value", Type: strT},
+	}}
+	bigint := func(s string) *big.Int {
+		v, ok := new(big.Int).SetString(s, 10)
+		if !ok {
+			panic(s)
+		}
+		return v
+	}
+	return []codectest.Col{
+		{Name: "h", Type: codectest.T(codec.TypeHugeint),
+			Vals: []any{bigint("-170141183460469231731687303715884105727"), nil, bigint("42")}},
+		{Name: "uh", Type: codectest.T(codec.TypeUHugeint),
+			Vals: []any{bigint("340282366920938463463374607431768211455"), nil, bigint("0")}},
+		{Name: "uuid", Type: codectest.T(codec.TypeUUID),
+			Vals: []any{codec.UUID{0xc8, 0x18, 0x5c, 0xa9, 0x1c, 0x05, 0x40, 0xc3, 0x8a, 0x22, 0x0f, 0x63, 0x28, 0x86, 0x28, 0x8c}, nil,
+				codec.UUID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}}},
+		{Name: "iv", Type: codectest.T(codec.TypeInterval),
+			Vals: []any{codec.Interval{Months: 14, Days: 3, Micros: 4_500_000}, nil,
+				codec.Interval{Months: -1, Days: 0, Micros: -1}}},
+		{Name: "ttz", Type: codectest.T(codec.TypeTimeTZ),
+			Vals: []any{codec.TimeTZ{Micros: 45_015_000_000, Offset: 19800}, nil,
+				codec.TimeTZ{Micros: 1, Offset: -3600}}},
+		{Name: "tns", Type: codectest.T(codec.TypeTimeNS),
+			Vals: []any{codec.TimeNS(45_015_123_456_789), nil, codec.TimeNS(1)}},
+		{Name: "bits", Type: codectest.T(codec.TypeBit),
+			Vals: []any{"010110110", nil, "1"}},
+		{Name: "li", Type: listInt,
+			Vals: []any{[]any{int32(1), nil, int32(3)}, nil, []any{}}},
+		{Name: "ll", Type: codec.LogicalType{ID: codec.TypeList, Child: &listInt},
+			Vals: []any{[]any{[]any{int32(1)}, nil}, nil, []any{[]any{}}}},
+		{Name: "st", Type: nestT,
+			Vals: []any{
+				codec.Struct{{Name: "id", Value: int32(7)}, {Name: "pt", Value: codec.Struct{{Name: "x", Value: int32(1)}, {Name: "y", Value: "a"}}}},
+				nil,
+				codec.Struct{{Name: "id", Value: nil}, {Name: "pt", Value: nil}},
+			}},
+		{Name: "m", Type: codec.LogicalType{ID: codec.TypeMap, Child: &kvT},
+			Vals: []any{
+				[]codec.MapEntry{{Key: "a", Value: int32(1)}, {Key: "b", Value: nil}},
+				nil,
+				[]codec.MapEntry{},
+			}},
+		{Name: "mi", Type: codec.LogicalType{ID: codec.TypeMap, Child: &ikvT},
+			Vals: []any{
+				[]codec.MapEntry{{Key: int32(10), Value: "ten"}},
+				[]codec.MapEntry{},
+				nil,
+			}},
+		{Name: "arr", Type: codec.LogicalType{ID: codec.TypeArray, Child: &intT, ArraySize: 3},
+			Vals: []any{[]any{int32(1), nil, int32(3)}, nil, []any{int32(0), int32(0), int32(0)}}},
+	}
+}
+
+func TestTier2RoundTrip(t *testing.T) {
+	cd := mustCodec(t)
+	cols := tier2Cols()
+	ch, err := cd.DecodeChunk(codectest.EncodeChunk(cols))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ci, col := range cols {
+		for ri, want := range col.Vals {
+			got, err := ch.Value(ci, ri)
+			if err != nil {
+				t.Fatalf("%s[%d]: %v", col.Name, ri, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s[%d]: got %#v, want %#v", col.Name, ri, got, want)
+			}
+		}
 	}
 }
 
@@ -174,32 +267,31 @@ func TestFetchBodyRoundTrip(t *testing.T) {
 
 func TestUnsupportedColumnDoesNotPoisonChunk(t *testing.T) {
 	cd := mustCodec(t)
-	// A LIST column is Tier 2: it must parse (the stream stays in sync)
-	// and error per column, leaving its neighbor decodable.
-	inner := codectest.T(codec.TypeInteger)
+	// UNION stays beyond this codec: it must parse (struct-shaped storage,
+	// tag child first) and error per column, leaving its neighbor decodable.
+	union := codec.LogicalType{ID: codec.TypeUnion, Fields: []codec.StructField{
+		{Name: "", Type: codectest.T(codec.TypeUTinyint)},
+		{Name: "i", Type: codectest.T(codec.TypeInteger)},
+	}}
 	var w qser.Writer
 	w.FieldUvarint(100, 2) // rows
 	w.Field(101)
 	w.Uvarint(2)
-	codectest.WriteType(&w, codec.LogicalType{ID: codec.TypeList, Child: &inner})
+	codectest.WriteType(&w, union)
 	codectest.WriteType(&w, codectest.T(codec.TypeInteger))
 	w.Field(102)
 	w.Uvarint(2)
-	// list vector: no nulls, 2 entries, child with 3 ints
+	// union vector: no nulls, tag child then one member child
 	w.FieldBool(100, false)
-	w.FieldUvarint(104, 3) // list_size
-	w.Field(105)
+	w.Field(103)
 	w.Uvarint(2)
-	for _, e := range [][2]uint64{{0, 2}, {2, 1}} {
-		w.FieldUvarint(100, e[0])
-		w.FieldUvarint(101, e[1])
-		w.End()
-	}
-	w.Field(106) // child vector
 	w.FieldBool(100, false)
-	w.FieldBytes(102, []byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0})
-	w.End() // child object
-	w.End() // list vector element
+	w.FieldBytes(102, []byte{0, 0})
+	w.End()
+	w.FieldBool(100, false)
+	w.FieldBytes(102, []byte{1, 0, 0, 0, 2, 0, 0, 0})
+	w.End()
+	w.End() // union vector element
 	// plain integer neighbor
 	w.FieldBool(100, false)
 	w.FieldBytes(102, []byte{9, 0, 0, 0, 8, 0, 0, 0})
@@ -211,11 +303,66 @@ func TestUnsupportedColumnDoesNotPoisonChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ch.Value(0, 0); err == nil {
-		t.Fatal("LIST column decoded; it should be unsupported")
+		t.Fatal("UNION column decoded; it should be unsupported")
 	} else if _, ok := err.(codec.ErrUnsupportedType); !ok {
 		t.Fatalf("want ErrUnsupportedType, got %v", err)
 	}
 	if v, err := ch.Value(1, 1); err != nil || v != int32(8) {
+		t.Fatalf("neighbor column: %v, %v", v, err)
+	}
+}
+
+// TestUnsupportedChildDegradesColumn: a LIST of UNION cannot produce values,
+// but the bytes still parse and the error names the child type.
+func TestUnsupportedChildDegradesColumn(t *testing.T) {
+	cd := mustCodec(t)
+	union := codec.LogicalType{ID: codec.TypeUnion, Fields: []codec.StructField{
+		{Name: "", Type: codectest.T(codec.TypeUTinyint)},
+		{Name: "i", Type: codectest.T(codec.TypeInteger)},
+	}}
+	var w qser.Writer
+	w.FieldUvarint(100, 1)
+	w.Field(101)
+	w.Uvarint(2)
+	codectest.WriteType(&w, codec.LogicalType{ID: codec.TypeList, Child: &union})
+	codectest.WriteType(&w, codectest.T(codec.TypeInteger))
+	w.Field(102)
+	w.Uvarint(2)
+	// list vector: 1 row of 2 union elements
+	w.FieldBool(100, false)
+	w.FieldUvarint(104, 2)
+	w.Field(105)
+	w.Uvarint(1)
+	w.FieldUvarint(100, 0)
+	w.FieldUvarint(101, 2)
+	w.End()
+	w.Field(106)
+	w.FieldBool(100, false)
+	w.Field(103)
+	w.Uvarint(2)
+	w.FieldBool(100, false)
+	w.FieldBytes(102, []byte{0, 0})
+	w.End()
+	w.FieldBool(100, false)
+	w.FieldBytes(102, []byte{1, 0, 0, 0, 2, 0, 0, 0})
+	w.End()
+	w.End() // child object
+	w.End() // list vector element
+	w.FieldBool(100, false)
+	w.FieldBytes(102, []byte{7, 0, 0, 0})
+	w.End()
+	w.End()
+
+	ch, err := cd.DecodeChunk(w.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ch.Value(0, 0)
+	ue, ok := err.(codec.ErrUnsupportedType)
+	if !ok || ue.Type.ID != codec.TypeUnion {
+		t.Fatalf("want ErrUnsupportedType naming UNION, got %v", err)
+	}
+	if v, err := ch.Value(1, 0); err != nil || v != int32(7) {
 		t.Fatalf("neighbor column: %v, %v", v, err)
 	}
 }
@@ -369,5 +516,38 @@ func TestTimeString(t *testing.T) {
 	}
 	if got := codec.Time(45015123456).String(); got != "12:30:15.123456" {
 		t.Errorf("Time = %q, want 12:30:15.123456", got)
+	}
+	// duckdb trims trailing zeros in fractional seconds; matching it keeps
+	// rendered values diffable against the official client.
+	if got := codec.Time(45015500000).String(); got != "12:30:15.5" {
+		t.Errorf("Time = %q, want 12:30:15.5", got)
+	}
+}
+
+// The String() renderings mirror duckdb's VARCHAR casts; the expectations
+// here were confirmed against duckdb v1.5.4 output.
+func TestTier2ValueStrings(t *testing.T) {
+	for _, tc := range []struct {
+		v    fmt.Stringer
+		want string
+	}{
+		{codec.UUID{0xc8, 0x18, 0x5c, 0xa9, 0x1c, 0x05, 0x40, 0xc3, 0x8a, 0x22, 0x0f, 0x63, 0x28, 0x86, 0x28, 0x8c},
+			"c8185ca9-1c05-40c3-8a22-0f632886288c"},
+		{codec.Interval{}, "00:00:00"},
+		{codec.Interval{Months: 14, Days: 3, Micros: 4_500_000}, "1 year 2 months 3 days 00:00:04.5"},
+		{codec.Interval{Months: -1}, "-1 month"},
+		{codec.Interval{Months: -26, Micros: -3_600_000_001}, "-2 years -2 months -01:00:00.000001"},
+		{codec.Interval{Days: 2}, "2 days"},
+		{codec.TimeTZ{Micros: 45_015_000_000, Offset: 19800}, "12:30:15+05:30"},
+		{codec.TimeTZ{Micros: 1, Offset: -3600}, "00:00:00.000001-01"},
+		// duckdb skips the minutes component when zero even if seconds
+		// follow; the ambiguity is upstream's.
+		{codec.TimeTZ{Micros: 0, Offset: 30}, "00:00:00+00:30"},
+		{codec.TimeNS(45_015_123_456_789), "12:30:15.123456789"},
+		{codec.TimeNS(45_015_500_000_000), "12:30:15.5"},
+	} {
+		if got := tc.v.String(); got != tc.want {
+			t.Errorf("%T %#v = %q, want %q", tc.v, tc.v, got, tc.want)
+		}
 	}
 }

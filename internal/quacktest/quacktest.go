@@ -170,10 +170,21 @@ func (s *Server) withConn(w http.ResponseWriter, hdr wire.Header, h func()) {
 	ok := s.conns[hdr.ConnectionID]
 	s.mu.Unlock()
 	if !ok {
-		s.errorReply(w, "Connection does not exist / already disconnected")
+		// The real server's text for an unknown connection id on any normal
+		// message; DISCONNECT alone answers with the longer variant below.
+		s.errorReply(w, "Invalid connection id")
 		return
 	}
 	h()
+}
+
+// ExpireConnections forgets every live connection, as a server restart
+// would; subsequent requests on old ids get the real server's error text.
+func (s *Server) ExpireConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.conns)
+	s.activeConn = 0
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, body []byte) {

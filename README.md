@@ -47,15 +47,23 @@ new registered codec version rather than a fork of the tree.
 
 ## Type coverage
 
-Tier 1 ships now: BOOLEAN, the integer family (signed and unsigned),
-FLOAT/DOUBLE, DECIMAL at every physical width including INT128, VARCHAR and
-BLOB, ENUM, DATE, TIME, all four TIMESTAMP precisions plus TIMESTAMPTZ,
-with NULL/validity everywhere, across flat, constant, dictionary, and
-sequence vector encodings.
+Tier 1: BOOLEAN, the integer family (signed and unsigned), FLOAT/DOUBLE,
+DECIMAL at every physical width including INT128, VARCHAR and BLOB, ENUM,
+DATE, TIME, all four TIMESTAMP precisions plus TIMESTAMPTZ — with
+NULL/validity everywhere, across flat, constant, dictionary, and sequence
+vector encodings.
 
-Nested and exotic types (LIST, STRUCT, MAP, HUGEINT, UUID, ...) come later.
-A column duckcall cannot decode reports `codec.ErrUnsupportedType` for that
-column; its neighbors still decode.
+Tier 2: nested types — LIST (`[]any`), STRUCT (`codec.Struct`, ordered
+fields), MAP (`[]codec.MapEntry`; duckdb map keys are not always strings),
+ARRAY (`[]any`) — with per-level validity, plus HUGEINT/UHUGEINT
+(`*big.Int`), UUID, INTERVAL, TIMETZ, TIME_NS, and BIT. Through
+database/sql, exotic scalars cross as their duckdb-style strings (or int64
+when lossless) and nested values cross as JSON.
+
+Still out: UNION, VARIANT, and GEOMETRY values (their bytes parse; the
+column errors), and FSST vectors, which DuckDB flattens before Quack
+serialization ever sees them. A column duckcall cannot decode reports
+`codec.ErrUnsupportedType` for that column; its neighbors still decode.
 
 ## Placeholders
 
@@ -73,13 +81,16 @@ register per negotiated version, so 1.5.x and 2.0 decoders will coexist in
 one binary during the transition. Expect breaking releases while upstream
 breaks; each one gets a changelog entry naming the upstream commit.
 
-Fixtures come from two sources: synthetic ones built by `codec/codectest`
-and fuzzed from day one, and a captured corpus from a live `quack_serve`
-(DuckDB v1.5.4) in `testdata/corpus`, which the envelope tests decode and
-re-encode byte for byte. The corpus regenerates by putting any logging
-proxy between `quack_serve` and the official client and driving
-`quack_query` through it. A differential conformance harness against the
-official client is the next milestone.
+Fixtures come from three sources: synthetic ones built by `codec/codectest`
+and fuzzed from day one; a captured corpus from a live `quack_serve`
+(DuckDB v1.5.4) in `testdata/corpus`, including per-type PREPARE_RESPONSE
+frames whose cell values the tests assert exactly, plus a malformed-payload
+corpus that must decode to structured errors; and a differential harness
+(`QUACK_LIVE=1 go test -run TestLive .`) that spawns a real `quack_serve`,
+runs the type matrix through both duckcall and the official client
+(`quack_query`), and diffs results cell by cell. The corpus regenerates by
+putting any logging proxy between `quack_serve` and the official client and
+driving `quack_query` through it.
 
 ## quackbouncer
 

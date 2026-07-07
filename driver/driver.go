@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mehrabr/duckcall"
+	"github.com/mehrabr/duckcall/wire"
 )
 
 func init() {
@@ -75,6 +76,14 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	}
 	res, err := c.dc.Query(ctx, sql)
 	if err != nil {
+		// An expired session at submission means the query never ran:
+		// ErrBadConn is safe here and lets database/sql retire this conn
+		// and retry on a fresh one. It is NOT safe mid-result — a lost
+		// connection loses fetched-but-undelivered batches, and rows.Next
+		// must surface that as the error it is, never as a silent retry.
+		if errors.Is(err, wire.ErrConnectionExpired) {
+			return nil, driver.ErrBadConn
+		}
 		return nil, err
 	}
 	return newRows(ctx, res), nil
@@ -93,7 +102,13 @@ func (c *conn) Close() error {
 	// goodbye so a dead server cannot wedge the pool.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return c.dc.Close(ctx)
+	err := c.dc.Close(ctx)
+	if errors.Is(err, wire.ErrConnectionExpired) {
+		// Disconnecting a session the server already forgot is the outcome
+		// Close wanted.
+		return nil
+	}
+	return err
 }
 
 func (c *conn) Begin() (driver.Tx, error) {
